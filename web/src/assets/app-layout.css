@@ -1,0 +1,563 @@
+.topbar {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: 10;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: calc(12px + env(safe-area-inset-top, 0px)) 16px 12px;
+  border-bottom: 1px solid rgba(148,163,184,0.12);
+  background: #0f172a;
+  box-shadow: 0 4px 16px rgba(0,0,0,0.3);
+  will-change: transform;
+}
+
+.topbar .title {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 16px;
+  font-weight: 700;
+  letter-spacing: 2px;
+  color: #e0f2fe;
+  font-family: 'SF Mono', SFMono-Regular, Consolas, 'Liberation Mono', Menlo, monospace;
+}
+
+.topbar .actions {
+  display: flex;
+  align-items: center;
+}
+
+.topbar .title img.brand {
+  height: 20px;
+  width: auto;
+  display: block;
+  filter: brightness(0) invert(1);
+}
+.topbar .title img.brand.mono-done,
+.topbar .title img.brand.color-logo {
+  filter: none;
+}
+
+.connection-indicator {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  font-weight: 500;
+  color: #94a3b8;
+  font-family: system-ui, -apple-system, 'Segoe UI', Roboto, 'Noto Sans TC', sans-serif;
+  letter-spacing: 0.3px;
+}
+
+.connection-indicator .dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 999px;
+  background: #ef4444;
+  box-shadow: 0 0 0 1px rgba(15, 23, 42, 0.08);
+  transition: background .2s ease, box-shadow .2s ease;
+}
+
+.connection-indicator.online .dot {
+  background: #22c55e;
+  box-shadow: 0 0 0 1px rgba(34, 197, 94, 0.4);
+}
+
+.connection-indicator.connecting .dot {
+  background: #f97316;
+  box-shadow: 0 0 0 1px rgba(249, 115, 22, 0.35);
+}
+
+.connection-indicator.degraded .dot {
+  background: #eab308;
+  box-shadow: 0 0 0 1px rgba(234, 179, 8, 0.4);
+}
+
+.messages-ws-indicator {
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+}
+
+.messages-ws-indicator .dot {
+  width: 8px;
+  height: 8px;
+}
+
+.user-menu {
+  position: relative;
+}
+
+.user-avatar-btn {
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  border: 1px solid rgba(148,163,184,0.25);
+  background: var(--bg-elevated);
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  overflow: visible;
+  box-shadow: 0 6px 18px rgba(0,0,0,0.25);
+  cursor: pointer;
+  transition: transform .16s ease, box-shadow .16s ease;
+}
+
+.user-avatar-btn:active {
+  transform: scale(0.97);
+}
+
+.user-avatar-btn img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  border-radius: 50%;
+}
+
+.user-menu-dropdown {
+  position: absolute;
+  top: calc(100% + 10px);
+  right: 0;
+  min-width: 168px;
+  border-radius: 14px;
+  border: 1px solid var(--line);
+  background: var(--bg-surface);
+  box-shadow: 0 18px 36px rgba(0, 0, 0, 0.35);
+  padding: 8px 0;
+  display: none;
+}
+
+.user-menu-dropdown.open {
+  display: block;
+}
+
+.user-menu-item {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 16px;
+  background: none;
+  border: none;
+  text-align: left;
+  font-size: 14px;
+  color: var(--fg);
+  cursor: pointer;
+  letter-spacing: 0.2px;
+}
+
+.user-menu-item:hover,
+.user-menu-item:focus {
+  background: var(--bg-elevated);
+  outline: none;
+}
+
+.user-menu-item.logout {
+  color: #fca5a5;
+}
+
+.menu-item-badge {
+  margin-left: auto;
+  min-width: 16px;
+  height: 16px;
+  padding: 0 5px;
+  border-radius: 999px;
+  background: #ef4444;
+  color: #fff;
+  font-size: 11px;
+  font-weight: 700;
+  display: none;
+  align-items: center;
+  justify-content: center;
+  line-height: 16px;
+  box-shadow: 0 4px 10px rgba(239, 68, 68, 0.35);
+}
+
+.user-menu-divider {
+  height: 1px;
+  background: rgba(148, 163, 184, 0.35);
+  margin: 6px 0;
+}
+
+.user-avatar-wrap {
+  position: relative;
+  display: inline-flex;
+}
+
+.user-menu-badge {
+  position: absolute;
+  top: -2px;
+  right: -2px;
+  min-width: 14px;
+  height: 14px;
+  padding: 0 3px;
+  border-radius: 999px;
+  background: #ef4444;
+  color: #fff;
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 14px;
+  display: none;
+  box-shadow: 0 4px 10px rgba(239, 68, 68, 0.35);
+}
+
+.user-avatar-wrap.has-alert .user-menu-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.content {
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  height: calc(var(--app-height) - var(--topbar-offset) - var(--navbar-height));
+  min-height: calc(var(--app-height) - var(--topbar-offset) - var(--navbar-height));
+  overflow: hidden;
+}
+
+.content.fullscreen {
+  padding: 12px;
+  height: calc(var(--app-height) - var(--topbar-offset));
+  min-height: calc(var(--app-height) - var(--topbar-offset));
+  overflow: hidden;
+}
+
+.content>.tab {
+  flex: 1 1 auto;
+  min-height: 0;
+  height: auto;
+  overflow: visible;
+  padding-bottom: calc(var(--navbar-height) + 8px);
+}
+
+.content>#tab-profile {
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+}
+
+body.messages-fullscreen {
+  overflow: hidden;
+}
+
+body.messages-fullscreen main.content.fullscreen {
+  height: calc(var(--app-height) - var(--topbar-offset));
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+
+body.messages-fullscreen .messages-pane {
+  flex: 1 1 auto;
+}
+
+body.messages-fullscreen .messages-thread {
+  flex: 1 1 auto;
+}
+
+body.messages-fullscreen .messages-scroll {
+  height: 100%;
+  overflow-y: auto;
+}
+
+.messages-header {
+  position: sticky;
+  top: 0;
+  z-index: 5;
+  background: var(--bg-surface);
+}
+
+.messages-peer-avatar {
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  overflow: hidden;
+  background: var(--bg-elevated);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 14px;
+  color: #94a3b8;
+  flex: 0 0 36px;
+}
+
+.messages-peer-avatar img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+
+/* ── Ephemeral: red SENTRY logo + flame ring on header avatar ── */
+.messages-peer-avatar.ephemeral-active {
+  overflow: visible;
+  background: radial-gradient(circle at 50% 60%, rgba(239,68,68,0.22) 0%, rgba(220,38,38,0.08) 60%, transparent 80%);
+  position: relative;
+  box-shadow: 0 0 0 2px rgba(239,68,68,0.35);
+  animation: eph-header-avatar-glow 2s ease-in-out infinite;
+}
+
+.messages-peer-avatar.ephemeral-active img,
+.messages-peer-avatar.ephemeral-active .avatar-placeholder {
+  display: none !important;
+}
+
+.messages-peer-avatar.ephemeral-active::before {
+  content: '';
+  position: absolute;
+  inset: -3px;
+  border-radius: 50%;
+  background: conic-gradient(
+    from 0deg,
+    rgba(239,68,68,0.0) 0%,
+    rgba(239,68,68,0.5) 15%,
+    rgba(249,115,22,0.6) 30%,
+    rgba(234,179,8,0.35) 45%,
+    rgba(239,68,68,0.0) 55%,
+    rgba(220,38,38,0.5) 70%,
+    rgba(249,115,22,0.35) 85%,
+    rgba(239,68,68,0.0) 100%
+  );
+  z-index: 0;
+  animation: eph-header-flame-spin 3s linear infinite;
+  mask: radial-gradient(circle, transparent 56%, black 58%);
+  -webkit-mask: radial-gradient(circle, transparent 56%, black 58%);
+}
+
+.messages-peer-avatar.ephemeral-active::after {
+  content: '';
+  width: 22px;
+  height: 22px;
+  background: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 48 48'%3E%3Cpath fill='%23ef4444' d='M7.24,24.01v11.3l12,8.08-1.23-11.99s-3.03-1.09-4.77-2.18-1.78-2.87-1.78-2.87l-4.22-2.33Z'/%3E%3Cpath fill='%23ef4444' d='M40.7,21.2L15.97,14.48v-.76l8.03-2.18,16.71,4.54,.06-6.92L24.01,4.61v.02s-.02-.02-.02-.02L7.24,9.16h0s0,.01,0,.01v9.88h.09s14.75,4.02,14.75,4.02h0v11.76l1.98,1.44,1.93-1.44v-6.09l10.79-3.69-.34,1.92c-.17,.62-.59,1.56-1.67,2.24-1.75,1.1-4.77,2.18-4.77,2.18l-1.23,11.99,12-8.08v-11.3l-.04,.02-.03-2.84Z'/%3E%3C/svg%3E") no-repeat center / contain;
+  position: relative;
+  z-index: 1;
+  filter: drop-shadow(0 0 3px rgba(239,68,68,0.5));
+}
+
+@keyframes eph-header-flame-spin {
+  from { transform: rotate(0deg); }
+  to   { transform: rotate(360deg); }
+}
+
+@keyframes eph-header-avatar-glow {
+  0%, 100% { box-shadow: 0 0 0 2px rgba(239,68,68,0.35), 0 0 6px rgba(239,68,68,0.12); }
+  50%      { box-shadow: 0 0 0 2px rgba(249,115,22,0.5), 0 0 12px rgba(239,68,68,0.25); }
+}
+
+/* ── Floating glass-pill navbar ── */
+.navbar {
+  position: fixed;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  z-index: 10;
+  display: flex;
+  justify-content: center;
+  padding: 8px 16px calc(8px + env(safe-area-inset-bottom, 0px));
+  /* Transparent above the pill area, solid #0f172a in the safe-area
+     zone so Safari's translucent bottom toolbar samples the right color */
+  background: linear-gradient(
+    to bottom,
+    transparent calc(100% - env(safe-area-inset-bottom, 0px)),
+    #0f172a calc(100% - env(safe-area-inset-bottom, 0px))
+  );
+  border: none;
+  box-shadow: none;
+  pointer-events: none;
+  will-change: transform;
+}
+
+.navbar-pill {
+  display: flex;
+  gap: 2px;
+  padding: 4px;
+  border-radius: 22px;
+  background: rgba(51, 65, 85, 0.45);
+  backdrop-filter: saturate(180%) blur(24px);
+  -webkit-backdrop-filter: saturate(180%) blur(24px);
+  border: 1px solid rgba(148, 163, 184, 0.2);
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4),
+              inset 0 1px 0 rgba(255, 255, 255, 0.06);
+  pointer-events: auto;
+}
+
+.navbtn {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  border: none;
+  background: transparent;
+  padding: 6px 14px;
+  color: rgba(148, 163, 184, 0.6);
+  font-size: 10px;
+  min-width: 62px;
+  border-radius: 18px;
+  transition: background 0.25s ease, color 0.25s ease, box-shadow 0.25s ease;
+  touch-action: manipulation;
+}
+
+.navbtn .icon,
+.navbtn i {
+  font-size: 22px;
+  color: currentColor;
+  transition: color 0.25s ease;
+}
+
+.navbtn.active {
+  background: rgba(15, 23, 42, 0.6);
+  color: #e0f2fe;
+  box-shadow: inset 0 0 0 1px rgba(56, 189, 248, 0.18),
+              0 0 12px rgba(56, 189, 248, 0.08);
+}
+
+.navbtn:focus {
+  color: #e0f2fe;
+}
+
+.navbtn.active i {
+  background: linear-gradient(135deg, #38bdf8, #6366f1);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  color: transparent;
+}
+
+.navbtn.active .nav-icon {
+  stroke: #38bdf8;
+  color: #38bdf8;
+}
+
+.nav-badge {
+  position: absolute;
+  top: 2px;
+  right: 8px;
+  min-width: 16px;
+  padding: 1px 4px;
+  border-radius: 999px;
+  background: linear-gradient(135deg, #2563eb, #1d4ed8);
+  color: #fff;
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 1.2;
+  display: none;
+  box-shadow: 0 4px 10px rgba(37, 99, 235, 0.25);
+}
+
+.navbtn.has-badge .nav-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.nav-icon-stack {
+  position: relative;
+  width: 22px;
+  height: 22px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.nav-icon-stack i,
+.nav-icon-stack .icon {
+  position: absolute;
+  color: currentColor;
+  line-height: 1;
+}
+
+.nav-icon-stack .nav-icon-base {
+  font-size: 22px;
+}
+
+.nav-icon-stack .nav-icon-lock {
+  font-size: 13px;
+  bottom: -3px;
+  right: -6px;
+  color: #0ea5e9;
+}
+
+/* Drive now uses integrated cloud+lock SVG, no stack needed */
+
+.navbtn.active .nav-icon-stack .nav-icon-base {
+  background: linear-gradient(135deg, #38bdf8, #6366f1);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  color: transparent;
+}
+
+.navbtn.active .nav-icon-stack .nav-icon-lock {
+  color: #2563eb;
+}
+
+.orientation-overlay {
+  position: fixed;
+  inset: 0;
+  background: linear-gradient(160deg, rgba(15, 23, 42, 0.98), rgba(15, 23, 42, 0.92));
+  color: #f8fafc;
+  display: none;
+  align-items: center;
+  justify-content: center;
+  flex-direction: column;
+  gap: 12px;
+  text-align: center;
+  padding: 32px;
+  z-index: 2000;
+  font-size: 18px;
+  line-height: 1.6;
+  letter-spacing: 0.4px;
+}
+
+.orientation-overlay .icon {
+  font-size: 42px;
+  display: block;
+}
+
+html.orientation-block {
+  height: 100%;
+  overflow: hidden;
+}
+
+html.orientation-block body {
+  overflow: hidden;
+  height: 100%;
+}
+
+html.orientation-block .orientation-overlay {
+  display: flex;
+}
+/* Keyboard overlay mode */
+body.keyboard-open .topbar {
+  display: none;
+}
+
+body.keyboard-open .navbar {
+  display: none;
+}
+
+body.keyboard-open #tab-messages {
+  inset: 0;
+  z-index: 100;
+}
+
+body.keyboard-open .messages-header {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: 101;
+}
+
+body.keyboard-open .messages-scroll {
+  padding-top: 72px;
+}
+
+body.keyboard-open .messages-composer {
+  bottom: 0;
+  z-index: 102;
+}

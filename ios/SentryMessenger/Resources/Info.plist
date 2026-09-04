@@ -1,0 +1,105 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>zh-Hant</string>
+	<key>CFBundleDisplayName</key>
+	<string>SENTRY</string>
+	<key>CFBundleExecutable</key>
+	<string>$(EXECUTABLE_NAME)</string>
+	<key>CFBundleIdentifier</key>
+	<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>$(PRODUCT_NAME)</string>
+	<key>CFBundlePackageType</key>
+	<string>$(PRODUCT_BUNDLE_PACKAGE_TYPE)</string>
+	<key>CFBundleShortVersionString</key>
+	<string>$(MARKETING_VERSION)</string>
+	<key>CFBundleVersion</key>
+	<string>$(CURRENT_PROJECT_VERSION)</string>
+	<key>LSRequiresIPhoneOS</key>
+	<true/>
+	<key>UILaunchScreen</key>
+	<dict>
+		<key>UIColorName</key>
+		<string></string>
+	</dict>
+	<key>UISupportedInterfaceOrientations</key>
+	<array>
+		<string>UIInterfaceOrientationPortrait</string>
+		<string>UIInterfaceOrientationLandscapeLeft</string>
+		<string>UIInterfaceOrientationLandscapeRight</string>
+	</array>
+	<key>UISupportedInterfaceOrientations~ipad</key>
+	<array>
+		<string>UIInterfaceOrientationPortrait</string>
+		<string>UIInterfaceOrientationPortraitUpsideDown</string>
+		<string>UIInterfaceOrientationLandscapeLeft</string>
+		<string>UIInterfaceOrientationLandscapeRight</string>
+	</array>
+	<key>ITSAppUsesNonExemptEncryption</key>
+	<false/>
+	<key>UIBackgroundModes</key>
+	<array>
+		<string>remote-notification</string>
+		<!-- Keep voice/video call audio alive when backgrounded or screen-locked (P0). -->
+		<string>audio</string>
+		<!-- PushKit wake-on-incoming for VoIP calls (P2). Paired with PKPushRegistry
+		     in VoipPushService, which reports the call to CallKit on each push. -->
+		<string>voip</string>
+	</array>
+
+	<!-- Base URL of the hosted web messenger (override per scheme/UAT). -->
+	<key>WebBaseURL</key>
+	<string>https://app.message.sentry.red</string>
+
+	<!-- Embedded web bundle. Set UseBundledWeb=true to serve the UI from the
+	     app's WebApp/ folder over sentry-app://; ApiOrigin is the absolute
+	     backend the bundled web calls. Default off (loads WebBaseURL remotely). -->
+	<key>UseBundledWeb</key>
+	<string>false</string>
+	<key>ApiOrigin</key>
+	<string>https://app.message.sentry.red</string>
+
+	<!-- Permission usage strings -->
+	<key>NFCReaderUsageDescription</key>
+	<string>感應您的 NTAG424 安全卡片以登入。</string>
+	<key>NSCameraUsageDescription</key>
+	<string>用於視訊通話、掃描 QR 憑證與拍照分享。</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>用於語音與視訊通話。</string>
+	<key>NSPhotoLibraryUsageDescription</key>
+	<string>用於選取要傳送的相片與影片。</string>
+	<key>NSPhotoLibraryAddUsageDescription</key>
+	<string>用於將收到的媒體儲存到您的相簿。</string>
+	<key>NSFaceIDUsageDescription</key>
+	<string>用於以生物辨識保護您的帳號。</string>
+	<!-- WKWebView 內 WebRTC 需要本地網路權限以收集 ICE host/mDNS 候選；
+	     缺少此宣告會導致候選為 0、通話無法建立（音視訊全無）。 -->
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>用於建立點對點語音與視訊通話連線。</string>
+	<!-- Native WebRTC call path (mid-term migration). Default false = calls run
+	     in the WKWebView as today; flip to true only after device verification.
+	     See docs/native-webrtc-migration-plan.md. -->
+	<key>UseNativeCalls</key>
+	<string>false</string>
+	<!-- Native account WebSocket transport (Option B). When "true", the web routes
+	     the account WS through the native URLSession-backed AccountSocketService
+	     instead of WebKit's WebSocket. Default off; flip only after device test. -->
+	<key>UseNativeAccountSocket</key>
+	<string>false</string>
+	<!-- Native background media download (Tier 2). When "true", single-shot media
+	     downloads run through a background URLSession and are handed back via the
+	     sentry-dl:// scheme. Default off; web falls back on failure. -->
+	<key>UseNativeMediaDownload</key>
+	<string>false</string>
+	<!-- Native encrypted local cache (Tier 3). When "true", the web caches
+	     encrypted backend responses in a native Data-Protection store for offline
+	     reads / faster launch. Ciphertext only; wiped on logout. Default off. -->
+	<key>UseNativeLocalCache</key>
+	<string>false</string>
+</dict>
+</plist>

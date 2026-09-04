@@ -1,0 +1,1492 @@
+import { normalizeTimelineMessageId, normalizeCounterValue, normalizeRawMessageId, normalizeMsgTypeValue } from '../parser.js';
+import { isNearBottom } from './interactions.js';
+import { normalizeCallLogPayload, resolveViewerRole, describeCallLogForViewer } from '../../calls/call-log.js';
+import { getVaultAckCounter } from '../../messages-support/vault-ack-store.js';
+import { normalizeAccountDigest, getAccountDigest } from '../../../core/store.js';
+import { getTimeline } from '../../timeline-store.js';
+import { escapeHtml } from '../../../ui/mobile/ui-utils.js';
+import { resolveContactAvatarUrl } from '../../../ui/mobile/contact-core-store.js';
+import { downloadAndDecrypt } from '../../media.js';
+import { renderPdfViewer, cleanupPdfViewer, getPdfJsLibrary } from '../../../ui/mobile/viewers/pdf-viewer.js';
+import { isPptxMime, isPptxFilename, renderPptxThumbnail } from '../../../ui/mobile/viewers/pptx-viewer.js';
+import { isWordMime, isWordFilename, renderWordThumbnail } from '../../../ui/mobile/viewers/word-viewer.js';
+import { isExcelMime, isExcelFilename, renderExcelThumbnail } from '../../../ui/mobile/viewers/excel-viewer.js';
+import { logMsgEvent } from '../../../lib/logging.js';
+import {
+    consumeReplayPlaceholderReveal,
+    consumeGapPlaceholderReveal
+} from '../placeholder-store.js';
+import {
+    PLACEHOLDER_REVEAL_MS,
+    PLACEHOLDER_TEXT,
+    PLACEHOLDER_SHIMMER_MAX_ACTIVE
+} from '../../../ui/mobile/messages-ui-policy.js';
+import { t } from '/locales/index.js';
+
+const CALL_LOG_PHONE_ICON = '<svg viewBox="0 0 20 20" fill="none" aria-hidden="true"><path d="M2.003 5.884l3.75-1.5a1 1 0 011.316.593l1.2 3.199a1 1 0 01-.232 1.036l-1.516 1.52a11.037 11.037 0 005.516 5.516l1.52-1.516a1 1 0 011.036-.232l3.2 1.2a1 1 0 01.593 1.316l-1.5 3.75a1 1 0 01-1.17.6c-2.944-.73-5.59-2.214-7.794-4.418-2.204-2.204-3.688-4.85-4.418-7.794a1 1 0 01.6-1.17z" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"></path></svg>';
+const CALL_LOG_VIDEO_ICON = '<svg viewBox="0 0 20 20" fill="none" aria-hidden="true"><rect x="1.5" y="4.5" width="12" height="11" rx="2" stroke="currentColor" stroke-width="1.6"></rect><path d="M13.5 8.5l4.5-2.5v8l-4.5-2.5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"></path></svg>';
+
+const PLACEHOLDER_FAILED_TEXT = t('encryption.decryptFailed');
+const PLACEHOLDER_BLOCKED_TEXT = t('encryption.decryptBlocked');
+
+export function formatTimestamp(ts) {
+    if (!Number.isFinite(ts)) return '';
+    try {
+        const date = new Date(ts * 1000);
+        const now = new Date();
+
+        const startOfDay = (d) => {
+            const copy = new Date(d);
+            copy.setHours(0, 0, 0, 0);
+            return copy;
+        };
+
+        const today = startOfDay(now);
+        const msgDate = startOfDay(date);
+
+        const diffTime = today - msgDate;
+        const diffDays = diffTime / (1000 * 60 * 60 * 24);
+
+        const hours = String(date.getHours()).padStart(2, '0');
+        const minutes = String(date.getMinutes()).padStart(2, '0');
+
+        // Within 1 day (today)
+        if (diffDays === 0) {
+            return t('renderer.today', { time: `${hours}:${minutes}` });
+        }
+
+        // Within 2 days (yesterday)
+        if (diffDays === 1) {
+            return t('renderer.yesterday', { time: `${hours}:${minutes}` });
+        }
+
+        // Within 7 days
+        if (diffDays < 7 && diffDays > 0) {
+            const weekdays = [t('weekdays.sun'), t('weekdays.mon'), t('weekdays.tue'), t('weekdays.wed'), t('weekdays.thu'), t('weekdays.fri'), t('weekdays.sat')];
+            return t('renderer.weekdayTime', { weekday: weekdays[date.getDay()], time: `${hours}:${minutes}` });
+        }
+
+        const month = date.getMonth() + 1;
+        const dayOfMonth = date.getDate();
+        return t('renderer.dateTime', { month, day: dayOfMonth, time: `${hours}:${minutes}` });
+    } catch {
+        return '';
+    }
+}
+
+export function formatBytes(bytes) {
+    if (!Number.isFinite(bytes) || bytes < 0) return '';
+    const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+    let value = bytes;
+    let unitIndex = 0;
+    while (value >= 1024 && unitIndex < units.length - 1) {
+        value /= 1024;
+        unitIndex += 1;
+    }
+    const precision = value >= 100 ? 0 : value >= 10 ? 1 : 2;
+    const display = Number(value.toFixed(precision));
+    return `${display} ${units[unitIndex]}`;
+}
+
+export function formatFileMeta(media) {
+    const parts = [];
+    if (Number.isFinite(media?.size)) parts.push(formatBytes(media.size));
+    if (media?.contentType) parts.push(media.contentType);
+    return parts.join(' · ');
+}
+
+export function canPreviewMedia(media) {
+    if (!media || typeof media !== 'object') return false;
+    if (media.previewUrl) return true;
+    if (media.preview?.localUrl) return true;
+    if (media.preview?.objectKey && media.preview?.envelope) return true;
+    if (media.localUrl) return true;
+    if (media.objectKey && media.envelope) return true;
+    if (media.chunked && media.baseKey && media.manifestEnvelope) return true;
+    return false;
+}
+
+export async function ensureMediaPreviewUrl(media) {
+    if (!media) return null;
+    if (media.previewUrl) return media.previewUrl;
+    if (media.preview?.localUrl) {
+        media.previewUrl = media.preview.localUrl;
+        return media.previewUrl;
+    }
+    if (media.localUrl) {
+        media.previewUrl = media.localUrl;
+        return media.previewUrl;
+    }
+    const preferPreview = media.preview?.objectKey && media.preview?.envelope;
+    const targetKey = preferPreview ? media.preview.objectKey : media.objectKey;
+    const targetEnvelope = preferPreview ? media.preview.envelope : media.envelope;
+    const targetMessageKey = media.messageKey_b64 || media.message_key_b64 || null;
+    if (!targetKey || !targetEnvelope) return null;
+    if (media.previewPromise) return media.previewPromise;
+    media.previewPromise = downloadAndDecrypt({
+        key: targetKey,
+        envelope: targetEnvelope,
+        messageKeyB64: targetMessageKey
+    })
+        .then((result) => {
+            if (!result || !result.blob) return null;
+            const url = URL.createObjectURL(result.blob);
+            media.previewUrl = url;
+            if (preferPreview && media.preview) {
+                if (!media.preview.contentType && result.contentType) {
+                    media.preview.contentType = result.contentType;
+                }
+            } else if (!preferPreview && !media.contentType && result.contentType) {
+                media.contentType = result.contentType;
+            }
+            return url;
+        })
+        .catch((err) => {
+            console.warn('Media preview error:', err);
+            return null;
+        })
+        .finally(() => {
+            media.previewPromise = null;
+        });
+    return media.previewPromise;
+}
+
+export function setPreviewSource(el, media) {
+    if (!el || !media) return;
+    const apply = (url) => {
+        if (!url || typeof el.src !== 'string') return;
+        el.src = url;
+        if (el.tagName === 'VIDEO') {
+            try { el.load(); } catch { }
+        }
+    };
+    if (media.previewUrl) {
+        apply(media.previewUrl);
+        return;
+    }
+    if (media.localUrl) {
+        media.previewUrl = media.localUrl;
+        apply(media.previewUrl);
+        return;
+    }
+    const hasRemotePreview = (media.preview?.objectKey && media.preview?.envelope) || (media.objectKey && media.envelope);
+    if (!hasRemotePreview) return;
+    ensureMediaPreviewUrl(media).then((url) => {
+        if (url && typeof el.src === 'string' && !el.src) apply(url);
+    }).catch(() => { });
+}
+
+export async function renderPdfThumbnail(media, canvas) {
+    if (!canvas) return;
+    canvas.dataset.previewState = 'loading';
+    try {
+        let buffer = null;
+        const directUrl = media?.previewUrl || media?.preview?.localUrl || media?.localUrl || null;
+        if (directUrl) {
+            const res = await fetch(directUrl);
+            if (!res.ok) throw new Error('preview fetch failed');
+            buffer = await res.arrayBuffer();
+        } else if (media?.objectKey && media?.envelope) {
+            const { blob } = await downloadAndDecrypt({
+                key: media.objectKey,
+                envelope: media.envelope,
+                messageKeyB64: media.messageKey_b64 || media.message_key_b64 || null
+            });
+            buffer = await blob.arrayBuffer();
+        } else {
+            canvas.dataset.previewState = 'error';
+            return;
+        }
+        const pdfjsLib = await getPdfJsLibrary();
+        let doc;
+        try {
+            doc = await pdfjsLib.getDocument({ data: buffer }).promise;
+        } catch (loadErr) {
+            const msg = (loadErr?.message || '').toLowerCase();
+            if (msg.includes('password') || loadErr?.name === 'PasswordException') {
+                // Render password-protected placeholder
+                canvas.width = 220;
+                canvas.height = 293;
+                const pCtx = canvas.getContext('2d');
+                pCtx.fillStyle = '#1e293b';
+                pCtx.fillRect(0, 0, 220, 293);
+                const label = t('viewer.pdfPasswordProtected') || '🔒 Password-protected PDF';
+                const emoji = label.match(/^\p{Emoji_Presentation}/u)?.[0] || '\u{1F512}';
+                const text = label.replace(/^\p{Emoji_Presentation}\s*/u, '').trim() || label;
+                pCtx.font = '36px serif';
+                pCtx.textAlign = 'center';
+                pCtx.textBaseline = 'middle';
+                pCtx.fillText(emoji, 110, 126);
+                pCtx.font = '600 11px -apple-system, BlinkMacSystemFont, sans-serif';
+                pCtx.fillStyle = '#94a3b8';
+                pCtx.fillText(text, 110, 166);
+                canvas.dataset.previewState = 'ready';
+                return;
+            }
+            throw loadErr;
+        }
+        const page = await doc.getPage(1);
+        const viewport = page.getViewport({ scale: 1 });
+        const targetWidth = 220;
+        const scale = Math.min(3, Math.max(0.5, targetWidth / viewport.width));
+        const vp = page.getViewport({ scale });
+        canvas.width = vp.width;
+        canvas.height = vp.height;
+        const ctx = canvas.getContext('2d');
+        await page.render({ canvasContext: ctx, viewport: vp }).promise;
+        canvas.dataset.previewState = 'ready';
+        try { doc.cleanup?.(); doc.destroy?.(); } catch { }
+    } catch (err) {
+        canvas.dataset.previewState = 'error';
+        console.warn('PDF thumb error:', err);
+    }
+}
+
+export function isUserTimelineMessage(msg) {
+    if (!msg) return false;
+    const type = msg.msgType || msg.subtype || 'text';
+    // [FIX] Include 'call-log' as a user timeline message.
+    // Previously call-log was excluded, preventing thread preview updates,
+    // unread count increments, and notification triggers for call-log entries.
+    return type !== 'control';
+}
+
+export function isOutgoingFromSelf(msg, selfDigest) {
+    const senderDigest = normalizeAccountDigest(
+        msg.senderDigest || msg.sender_digest || msg.meta?.senderDigest || msg.meta?.sender_digest || msg.header?.sender_digest || null
+    );
+    return senderDigest ? senderDigest === selfDigest : msg.direction === 'outgoing';
+}
+
+export function resolveLatestOutgoingMessage(timelineMessages, selfDigest) {
+    const normalizedSelf = normalizeAccountDigest(selfDigest || null);
+    if (!Array.isArray(timelineMessages) || !timelineMessages.length) return null;
+    for (let i = timelineMessages.length - 1; i >= 0; i -= 1) {
+        const msg = timelineMessages[i];
+        if (!isUserTimelineMessage(msg)) continue;
+        if (!isOutgoingFromSelf(msg, normalizedSelf)) continue;
+        return msg;
+    }
+    return null;
+}
+
+export function resolveRenderEntryCounter(entry) {
+    const direct = normalizeCounterValue(entry?.counter ?? entry?.headerCounter ?? entry?.header_counter);
+    if (direct !== null) return direct;
+    const header = entry?.header && typeof entry.header === 'object' ? entry.header : null;
+    return normalizeCounterValue(header?.n ?? header?.counter);
+}
+
+export function computeStatusVisibility({ timelineMessages, conversationId, selfDigest } = {}) {
+    const visibleStatusSet = new Set();
+    const normalizedSelf = normalizeAccountDigest(selfDigest || null);
+
+    if (!Array.isArray(timelineMessages) || !timelineMessages.length) {
+        return { visibleStatusSet };
+    }
+
+    let foundDeliveredAnchor = false;
+
+    // Traverse backwards from newest to oldest
+    for (let i = timelineMessages.length - 1; i >= 0; i -= 1) {
+        const msg = timelineMessages[i];
+        if (!isUserTimelineMessage(msg)) continue;
+
+        // Skip non-outgoing messages
+        if (!isOutgoingFromSelf(msg, normalizedSelf)) continue;
+
+        const messageId = msg.id || msg.messageId || msg.serverMessageId;
+        if (!messageId) continue;
+
+        // Determine effective status (Sent vs Delivered)
+        // 1. Vault Count Check (Primary)
+        const vaultCount = Number(msg.vaultPutCount);
+        const countDelivered = Number.isFinite(vaultCount) && vaultCount >= 2;
+
+        // 2. Legacy Ack Counter Check (Secondary)
+        const msgCounter = resolveRenderEntryCounter(msg);
+        const ackCounter = conversationId ? getVaultAckCounter(conversationId) : null;
+        const legacyDelivered = Number.isFinite(msgCounter)
+            && Number.isFinite(ackCounter)
+            && ackCounter >= msgCounter;
+
+        const isDelivered = countDelivered || legacyDelivered || msg.status === 'delivered' || msg.status === 'read';
+
+        if (foundDeliveredAnchor) {
+            // We already found the anchor (latest delivered message).
+            // Any older message status is hidden.
+            continue;
+        }
+
+        // If we haven't found the anchor yet, this message status should be visible.
+        visibleStatusSet.add(messageId);
+
+        if (isDelivered) {
+            // This is the first "delivered" message we've seen going backwards.
+            // It becomes the anchor.
+            foundDeliveredAnchor = true;
+        }
+    }
+
+    return { visibleStatusSet };
+}
+
+export function computeDoubleTickMessageId(params = {}) {
+    // [DEPRECATED] Replaced by computeStatusVisibility
+    return null;
+}
+
+export function resolveLatestOutgoingMessageIdForConversation(conversationId) {
+    if (!conversationId) return null;
+    const timeline = getTimeline(conversationId);
+    let selfDigest = null;
+    try { selfDigest = normalizeAccountDigest(getAccountDigest()); } catch { }
+    const latest = resolveLatestOutgoingMessage(timeline, selfDigest);
+    return latest?.id || latest?.messageId || latest?.serverMessageId || null;
+}
+
+export function isLatestOutgoingForStatus(conversationId, messageId) {
+    if (!conversationId || !messageId) return false;
+    const latestId = resolveLatestOutgoingMessageIdForConversation(conversationId);
+    if (!latestId) return false;
+    return latestId === messageId;
+}
+
+export function buildRenderEntries({ timelineMessages = [] } = {}) {
+    const list = Array.isArray(timelineMessages) ? timelineMessages : [];
+    const shimmerIds = new Set();
+    const placeholders = list.filter((entry) => entry?.placeholder === true || entry?.msgType === 'placeholder');
+    const pending = placeholders.filter((entry) => entry?.status !== 'failed' && entry?.status !== 'blocked');
+    const shimmerMax = Math.max(0, Number(PLACEHOLDER_SHIMMER_MAX_ACTIVE) || 0);
+    if (pending.length) {
+        // User requested to ignore performance/limit for shimmer
+        const start = 0; // Math.max(0, pending.length - shimmerMax);
+        for (let i = start; i < pending.length; i += 1) {
+            const id = pending[i]?.messageId || pending[i]?.id || null;
+            if (id) shimmerIds.add(id);
+        }
+        console.log('[Renderer] Shimmer Debug', {
+            pendingCount: pending.length,
+            shimmerCount: shimmerIds.size,
+            sampleId: pending[0]?.id
+        });
+    }
+    return { entries: list, shimmerIds };
+}
+
+export class MessageRenderer {
+    constructor({ messagesListEl, scrollEl, callbacks = {} }) {
+        this.listEl = messagesListEl;
+        this.scrollEl = scrollEl || null;
+        this.callbacks = callbacks;
+        this.shimmerIds = new Set();
+        this._previewLoadedSet = new WeakSet();
+        this._previewObserver = null;
+        this._pendingObserve = []; // elements queued before observer is ready
+    }
+
+    /** Lazily create the IntersectionObserver (needs scrollEl to be in DOM) */
+    _ensurePreviewObserver() {
+        if (this._previewObserver) return this._previewObserver;
+        this._previewObserver = new IntersectionObserver((entries) => {
+            for (const entry of entries) {
+                const el = entry.target;
+                if (entry.isIntersecting) {
+                    if (!this._previewLoadedSet.has(el) && el._lazyMedia) {
+                        this._previewLoadedSet.add(el);
+                        this._loadFilePreview(el, el._lazyMedia);
+                    }
+                } else {
+                    if (this._previewLoadedSet.has(el) && el._lazyMedia && el._lazyType === 'heavy') {
+                        this._previewLoadedSet.delete(el);
+                        this._releaseFilePreview(el);
+                    }
+                }
+            }
+        }, { root: this.scrollEl || null, rootMargin: '200px 0px' });
+        // Flush any elements queued before observer was created
+        for (const el of this._pendingObserve) this._previewObserver.observe(el);
+        this._pendingObserve = [];
+        return this._previewObserver;
+    }
+
+    /**
+     * After media elements load, maintain scroll position if user was near bottom.
+     * Prevents content from shifting away when images/videos finish loading.
+     */
+    async _renderPptxThumbnail(media, canvas, container) {
+        try {
+            let buffer = null;
+            const directUrl = media?.previewUrl || media?.preview?.localUrl || media?.localUrl || null;
+            if (directUrl) {
+                const res = await fetch(directUrl);
+                if (!res.ok) throw new Error('pptx fetch failed');
+                buffer = await res.arrayBuffer();
+            } else if (media?.objectKey && media?.envelope) {
+                const { blob } = await downloadAndDecrypt({
+                    key: media.objectKey,
+                    envelope: media.envelope,
+                    messageKeyB64: media.messageKey_b64 || media.message_key_b64 || null
+                });
+                buffer = await blob.arrayBuffer();
+            } else if (media?.chunked && media?.baseKey && media?.manifestEnvelope) {
+                // Chunked files — download via downloadAndDecrypt with chunked params
+                const { blob } = await downloadAndDecrypt({
+                    key: media.baseKey,
+                    envelope: media.manifestEnvelope,
+                    messageKeyB64: media.messageKey_b64 || media.message_key_b64 || null,
+                    chunked: true
+                });
+                buffer = await blob.arrayBuffer();
+            } else {
+                throw new Error('no source');
+            }
+            const ok = await renderPptxThumbnail(buffer, canvas);
+            if (ok) {
+                canvas.dataset.previewState = 'ready';
+            } else {
+                throw new Error('render failed');
+            }
+        } catch {
+            // Fallback to generic PowerPoint icon
+            canvas.remove();
+            const generic = document.createElement('div');
+            generic.className = 'message-file-preview-generic';
+            generic.innerHTML = '<svg class="icon file-type-icon" style="color:#ea580c"><use href="#i-presentation"/></svg>';
+            container.appendChild(generic);
+        }
+    }
+
+    async _renderWordThumbnail(media, placeholder, container) {
+        try {
+            let buffer = null;
+            const directUrl = media?.previewUrl || media?.preview?.localUrl || media?.localUrl || null;
+            if (directUrl) {
+                const res = await fetch(directUrl);
+                if (!res.ok) throw new Error('word fetch failed');
+                buffer = await res.arrayBuffer();
+            } else if (media?.objectKey && media?.envelope) {
+                const { blob } = await downloadAndDecrypt({
+                    key: media.objectKey,
+                    envelope: media.envelope,
+                    messageKeyB64: media.messageKey_b64 || media.message_key_b64 || null
+                });
+                buffer = await blob.arrayBuffer();
+            } else if (media?.chunked && media?.baseKey && media?.manifestEnvelope) {
+                const { blob } = await downloadAndDecrypt({
+                    key: media.baseKey,
+                    envelope: media.manifestEnvelope,
+                    messageKeyB64: media.messageKey_b64 || media.message_key_b64 || null,
+                    chunked: true
+                });
+                buffer = await blob.arrayBuffer();
+            } else {
+                return; // keep icon fallback
+            }
+            const thumb = renderWordThumbnail(buffer);
+            if (thumb && placeholder.parentNode) {
+                placeholder.replaceWith(thumb);
+            }
+        } catch {
+            // Keep existing icon fallback
+        }
+    }
+
+    async _renderExcelThumbnail(media, placeholder, container) {
+        try {
+            let buffer = null;
+            const directUrl = media?.previewUrl || media?.preview?.localUrl || media?.localUrl || null;
+            if (directUrl) {
+                const res = await fetch(directUrl);
+                if (!res.ok) throw new Error('excel fetch failed');
+                buffer = await res.arrayBuffer();
+            } else if (media?.objectKey && media?.envelope) {
+                const { blob } = await downloadAndDecrypt({
+                    key: media.objectKey,
+                    envelope: media.envelope,
+                    messageKeyB64: media.messageKey_b64 || media.message_key_b64 || null
+                });
+                buffer = await blob.arrayBuffer();
+            } else if (media?.chunked && media?.baseKey && media?.manifestEnvelope) {
+                const { blob } = await downloadAndDecrypt({
+                    key: media.baseKey,
+                    envelope: media.manifestEnvelope,
+                    messageKeyB64: media.messageKey_b64 || media.message_key_b64 || null,
+                    chunked: true
+                });
+                buffer = await blob.arrayBuffer();
+            } else {
+                return;
+            }
+            const thumb = await renderExcelThumbnail(buffer);
+            if (thumb && placeholder.parentNode) {
+                placeholder.replaceWith(thumb);
+            }
+        } catch {
+            // Keep existing icon fallback
+        }
+    }
+
+    /** Show a spinner placeholder in the preview container */
+    _showPreviewSpinner(container) {
+        const holder = document.createElement('div');
+        holder.className = 'message-file-preview-generic';
+        holder.innerHTML = '<div class="loading-spinner" style="width:28px;height:28px;border-width:3px"></div>';
+        container.appendChild(holder);
+    }
+
+    /** Actually load and render the file preview (called when entering viewport) */
+    _loadFilePreview(container, media) {
+        const type = (media?.contentType || '').toLowerCase();
+        const nameLower = (media?.name || '').toLowerCase();
+
+        // Clear spinner
+        container.innerHTML = '';
+
+        // If a pre-generated preview image exists (uploaded by sender, backfilled,
+        // or locally cached from a previous render), use it directly as an <img>.
+        const hasRemotePreview = media?.preview?.objectKey && media?.preview?.envelope;
+        const hasLocalPreview = media?.preview?.localUrl || media?.previewUrl;
+        if (hasRemotePreview || hasLocalPreview) {
+            const img = document.createElement('img');
+            img.className = 'message-file-preview-img';
+            img.alt = media?.name || 'preview';
+            img.decoding = 'async';
+            img.style.cssText = 'width:100%;height:100%;object-fit:contain;border-radius:8px;background:#f8fafc;';
+            container.appendChild(img);
+            // Determine badge
+            let badgeLabel = null, badgeColor = null;
+            if (type === 'application/pdf' || nameLower.endsWith('.pdf')) { badgeLabel = 'PDF'; badgeColor = '#dc2626'; }
+            else if (isPptxMime(type) || isPptxFilename(media?.name)) { badgeLabel = 'PPTX'; badgeColor = '#ea580c'; }
+            else if (isWordMime(type) || isWordFilename(media?.name)) { badgeLabel = 'DOCX'; badgeColor = '#2563eb'; }
+            else if (isExcelMime(type) || isExcelFilename(media?.name)) { badgeLabel = 'XLSX'; badgeColor = '#16a34a'; }
+            if (badgeLabel) container.appendChild(this._fileTypeBadge(badgeLabel, badgeColor));
+            ensureMediaPreviewUrl(media).then(url => {
+                if (url) img.src = url;
+                else this._loadFilePreviewFallback(container, media, type, nameLower);
+            }).catch(() => this._loadFilePreviewFallback(container, media, type, nameLower));
+            return;
+        }
+
+        this._loadFilePreviewFallback(container, media, type, nameLower);
+    }
+
+    /** Request backfill: emit event so external code can upload and patch the preview */
+    _requestPreviewBackfill(media, canvas) {
+        if (!media || !canvas || !canvas.width || !canvas.height) return;
+        // Only backfill if the message has enough metadata to identify it
+        const messageId = media._messageId || media.messageId || null;
+        const conversationId = media._conversationId || media.conversationId || null;
+        const messageKeyB64 = media.messageKey_b64 || media.message_key_b64 || null;
+        if (!messageId || !conversationId) return;
+        try {
+            canvas.toBlob((blob) => {
+                if (!blob) return;
+                // Immediately set a local preview URL on the media object so
+                // subsequent IntersectionObserver re-entries use the cached
+                // image instead of re-rendering with heavy libraries.
+                const localUrl = URL.createObjectURL(blob);
+                if (!media.preview) media.preview = {};
+                media.preview.localUrl = localUrl;
+                media.preview.contentType = 'image/jpeg';
+                media.preview.width = canvas.width;
+                media.preview.height = canvas.height;
+                // Background: upload and patch server so other sessions benefit
+                document.dispatchEvent(new CustomEvent('media:preview-backfill', {
+                    detail: { messageId, conversationId, messageKeyB64, blob, width: canvas.width, height: canvas.height }
+                }));
+            }, 'image/jpeg', 0.82);
+        } catch { /* best-effort */ }
+    }
+
+    /** Convert an HTML element to a canvas via SVG foreignObject for backfill */
+    _htmlElementToCanvas(el) {
+        if (!el || !el.offsetWidth || !el.offsetHeight) return Promise.resolve(null);
+        const w = el.offsetWidth;
+        const h = el.offsetHeight;
+        const clone = el.cloneNode(true);
+        clone.querySelectorAll?.('script,iframe')?.forEach(n => n.remove());
+        const html = new XMLSerializer().serializeToString(clone);
+        const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${w}" height="${h}">` +
+            `<foreignObject width="100%" height="100%">` +
+            `<div xmlns="http://www.w3.org/1999/xhtml" style="width:${w}px;height:${h}px;overflow:hidden;background:#fff;">${html}</div>` +
+            `</foreignObject></svg>`;
+        const svgBlob = new Blob([svg], { type: 'image/svg+xml;charset=utf-8' });
+        const url = URL.createObjectURL(svgBlob);
+        return new Promise((resolve) => {
+            const img = new Image();
+            img.onload = () => {
+                const canvas = document.createElement('canvas');
+                canvas.width = w;
+                canvas.height = h;
+                const ctx = canvas.getContext('2d');
+                ctx.fillStyle = '#ffffff';
+                ctx.fillRect(0, 0, w, h);
+                ctx.drawImage(img, 0, 0);
+                URL.revokeObjectURL(url);
+                resolve(canvas);
+            };
+            img.onerror = () => { URL.revokeObjectURL(url); resolve(null); };
+            img.src = url;
+        });
+    }
+
+    /** Request backfill from an HTML element (Word/Excel) by converting to canvas first */
+    _requestPreviewBackfillFromHtml(media, el) {
+        if (!media || !el) return;
+        this._htmlElementToCanvas(el).then(canvas => {
+            if (canvas) this._requestPreviewBackfill(media, canvas);
+        }).catch(() => {});
+    }
+
+    /** Fallback: render file preview client-side (no pre-generated preview image) */
+    _loadFilePreviewFallback(container, media, type, nameLower) {
+        container.innerHTML = '';
+
+        if (type === 'application/pdf' || nameLower.endsWith('.pdf')) {
+            const pdf = document.createElement('canvas');
+            pdf.className = 'message-file-preview-pdf';
+            pdf.setAttribute('aria-label', media?.name || t('viewer.pdfPreview'));
+            pdf.dataset.previewState = 'loading';
+            container.appendChild(pdf);
+            container.appendChild(this._fileTypeBadge('PDF', '#dc2626'));
+            renderPdfThumbnail(media, pdf).then(() => {
+                if (pdf.dataset.previewState === 'ready') this._requestPreviewBackfill(media, pdf);
+            }).catch(() => {});
+        } else if (isPptxMime(type) || isPptxFilename(media?.name)) {
+            const pptxCanvas = document.createElement('canvas');
+            pptxCanvas.className = 'message-file-preview-pdf';
+            pptxCanvas.setAttribute('aria-label', media?.name || 'PPTX preview');
+            pptxCanvas.dataset.previewState = 'loading';
+            container.appendChild(pptxCanvas);
+            container.appendChild(this._fileTypeBadge('PPTX', '#ea580c'));
+            this._renderPptxThumbnail(media, pptxCanvas, container).then(() => {
+                if (pptxCanvas.dataset.previewState === 'ready') this._requestPreviewBackfill(media, pptxCanvas);
+            }).catch(() => {});
+        } else if (isWordMime(type) || isWordFilename(media?.name)) {
+            const wordDiv = document.createElement('div');
+            wordDiv.className = 'message-file-preview-generic';
+            wordDiv.innerHTML = '<svg class="icon file-type-icon" style="color:#2563eb"><use href="#i-file-text"/></svg>';
+            container.appendChild(wordDiv);
+            this._renderWordThumbnail(media, wordDiv, container).then(() => {
+                const rendered = container.firstElementChild;
+                if (rendered && rendered !== wordDiv) this._requestPreviewBackfillFromHtml(media, rendered);
+            }).catch(() => {});
+        } else if (isExcelMime(type) || isExcelFilename(media?.name)) {
+            const xlsDiv = document.createElement('div');
+            xlsDiv.className = 'message-file-preview-generic';
+            xlsDiv.innerHTML = '<svg class="icon file-type-icon" style="color:#16a34a"><use href="#i-file-spreadsheet"/></svg>';
+            container.appendChild(xlsDiv);
+            this._renderExcelThumbnail(media, xlsDiv, container).then(() => {
+                const rendered = container.firstElementChild;
+                if (rendered && rendered !== xlsDiv) this._requestPreviewBackfillFromHtml(media, rendered);
+            }).catch(() => {});
+        }
+    }
+
+    /** Release heavy preview content to free memory (called when leaving viewport) */
+    _releaseFilePreview(container) {
+        container.innerHTML = '';
+        this._showPreviewSpinner(container);
+    }
+
+    _fileTypeBadge(label, color) {
+        const badge = document.createElement('div');
+        badge.style.cssText = `position:absolute;bottom:4px;right:4px;background:${color};color:#fff;font-size:9px;font-weight:600;padding:2px 5px;border-radius:4px;line-height:1.2;pointer-events:none;letter-spacing:0.5px;opacity:0.9;z-index:1;`;
+        badge.textContent = label;
+        return badge;
+    }
+
+    _attachMediaLoadScrollGuard(el) {
+        if (!el) return;
+        const eventName = el.tagName === 'VIDEO' ? 'loadedmetadata' : 'load';
+        el.addEventListener(eventName, () => {
+            const scrollEl = this.scrollEl;
+            if (!scrollEl) return;
+            if (isNearBottom(scrollEl, 150)) {
+                scrollEl.scrollTop = scrollEl.scrollHeight;
+            }
+        }, { once: true });
+    }
+
+    attachMediaPreview(container, media) {
+        const type = (media?.contentType || '').toLowerCase();
+        const previewType = (media?.preview?.contentType || '').toLowerCase();
+        const hasPreviewImage = previewType.startsWith('image/') || (!!media?.preview && (!!media.preview.objectKey || !!media.preview.localUrl));
+        const nameLower = (media?.name || '').toLowerCase();
+        container.innerHTML = '';
+        container.classList.add('message-file-preview');
+        if (hasPreviewImage || type.startsWith('image/')) {
+            const img = document.createElement('img');
+            img.className = 'message-file-preview-image';
+            img.alt = media?.name || 'image preview';
+            img.decoding = 'async';
+            container.appendChild(img);
+            this._attachMediaLoadScrollGuard(img);
+            setPreviewSource(img, media);
+        } else if (type.startsWith('video/')) {
+            const hasPreview = media?.previewUrl || media?.preview?.localUrl ||
+                (media?.preview?.objectKey && media?.preview?.envelope);
+            if (hasPreview) {
+                const img = document.createElement('img');
+                img.className = 'message-file-preview-image';
+                img.alt = media?.name || 'video preview';
+                img.decoding = 'async';
+                container.appendChild(img);
+                this._attachMediaLoadScrollGuard(img);
+                setPreviewSource(img, media);
+            } else {
+                const generic = document.createElement('div');
+                generic.className = 'message-file-preview-generic';
+                generic.innerHTML = '<svg viewBox="0 0 24 24" width="32" height="32" fill="none" stroke="currentColor" stroke-width="1.5"><polygon points="5 3 19 12 5 21 5 3"/></svg>';
+                container.appendChild(generic);
+            }
+        } else if (type === 'application/pdf' || nameLower.endsWith('.pdf') ||
+                   isPptxMime(type) || isPptxFilename(media?.name) ||
+                   isWordMime(type) || isWordFilename(media?.name) ||
+                   isExcelMime(type) || isExcelFilename(media?.name)) {
+            // Heavy file previews — lazy load via IntersectionObserver
+            this._showPreviewSpinner(container);
+            container._lazyMedia = media;
+            container._lazyType = 'heavy';
+            // Defer observe until element is in DOM (next microtask)
+            queueMicrotask(() => this._ensurePreviewObserver().observe(container));
+        } else {
+            const generic = document.createElement('div');
+            generic.className = 'message-file-preview-generic';
+            const ext = (media?.name || '').split('.').pop()?.toLowerCase() || '';
+            const xlsExts = ['xlsx', 'xls', 'xlsm', 'csv'];
+            const docExts = ['docx', 'doc', 'docm', 'rtf'];
+            const pptExts = ['pptx', 'ppt', 'pptm', 'odp', 'key'];
+            const archiveExts = ['zip', 'rar', '7z', 'gz', 'tar', 'tgz', 'bz2'];
+            const txtExts = ['txt', 'md', 'log'];
+            const codeExts = ['json', 'xml', 'yml', 'yaml', 'js', 'ts', 'css', 'html', 'py', 'sh', 'sql', 'ini', 'toml', 'conf', 'env'];
+            const mediaType = (media?.contentType || '').toLowerCase();
+            if (archiveExts.includes(ext)) {
+                generic.innerHTML = '<svg class="icon file-type-icon" style="color:#d97706"><use href="#i-archive"/></svg>';
+            } else if (xlsExts.includes(ext)) {
+                generic.innerHTML = '<svg class="icon file-type-icon" style="color:#16a34a"><use href="#i-file-spreadsheet"/></svg>';
+            } else if (docExts.includes(ext)) {
+                generic.innerHTML = '<svg class="icon file-type-icon" style="color:#2563eb"><use href="#i-file-text"/></svg>';
+            } else if (pptExts.includes(ext)) {
+                generic.innerHTML = '<svg class="icon file-type-icon" style="color:#ea580c"><use href="#i-presentation"/></svg>';
+            } else if (txtExts.includes(ext) || mediaType.startsWith('text/plain')) {
+                generic.innerHTML = '<svg class="icon file-type-icon" style="color:#94a3b8"><use href="#i-file-text"/></svg>';
+            } else if (codeExts.includes(ext) || mediaType === 'application/json' || mediaType.startsWith('text/')) {
+                generic.innerHTML = '<svg class="icon file-type-icon" style="color:#8b5cf6"><use href="#i-file"/></svg>';
+            } else {
+                generic.innerHTML = '<svg class="icon file-type-icon" style="color:#64748b"><use href="#i-file"/></svg>';
+            }
+            container.appendChild(generic);
+        }
+    }
+
+    enableMediaPreviewInteraction(container, media) {
+        if (!container || !canPreviewMedia(media)) return;
+        container.classList.add('message-file-clickable');
+        container.setAttribute('role', 'button');
+        container.setAttribute('tabindex', '0');
+        const handler = (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            this.callbacks.onPreviewMedia?.(media);
+        };
+        container.addEventListener('click', handler);
+        container.addEventListener('keydown', (event) => {
+            if (event.key === 'Enter' || event.key === ' ') {
+                handler(event);
+            }
+        });
+    }
+
+    renderUploadOverlay(wrapper, media, msgId) {
+        if (!wrapper || !media) return;
+        const target = wrapper.querySelector?.('.message-file-preview');
+        if (!target) return;
+        target.style.position = 'relative';
+        const existing = target.querySelector('.message-file-overlay');
+        const shouldShow = media.uploading || (Number.isFinite(media.progress) && media.progress < 100) || media.error;
+        if (!shouldShow) {
+            if (existing) existing.remove();
+            return;
+        }
+
+        const pct = Number.isFinite(media.progress) ? Math.min(100, Math.max(0, Math.round(media.progress))) : null;
+
+        // Fast path: if overlay already exists and state hasn't changed type
+        // (still uploading, not switched to error), just update text + bar width.
+        if (existing && !media.error && existing.dataset.mode === 'uploading') {
+            const label = existing.querySelector('[data-role="label"]');
+            const bar = existing.querySelector('[data-role="bar"]');
+            if (label) label.textContent = pct != null ? t('renderer.uploadingPercent', { pct }) : t('renderer.preparingUpload');
+            if (bar) bar.style.width = `${pct != null ? pct : 10}%`;
+            return;
+        }
+
+        // Full build (first render or mode change to error)
+        const overlay = existing || document.createElement('div');
+        overlay.className = 'message-file-overlay';
+        Object.assign(overlay.style, {
+            position: 'absolute',
+            inset: '0',
+            background: media.error ? 'rgba(239,68,68,0.82)' : 'rgba(15,23,42,0.75)',
+            color: '#fff',
+            display: 'flex',
+            flexDirection: 'column',
+            alignItems: 'center',
+            justifyContent: 'center',
+            gap: '8px',
+            borderRadius: getComputedStyle(target).borderRadius || '12px',
+            pointerEvents: 'auto',
+            padding: '10px',
+            textAlign: 'center'
+        });
+        overlay.innerHTML = '';
+        if (media.error) {
+            overlay.dataset.mode = 'error';
+            const label = document.createElement('div');
+            label.textContent = t('renderer.uploadFailed');
+            label.style.fontWeight = '600';
+            overlay.appendChild(label);
+            const detail = document.createElement('div');
+            detail.textContent = String(media.error || '').slice(0, 80) || t('renderer.pleaseRetryLater');
+            detail.style.fontSize = '12px';
+            detail.style.opacity = '0.9';
+            overlay.appendChild(detail);
+        } else {
+            overlay.dataset.mode = 'uploading';
+            const label = document.createElement('div');
+            label.dataset.role = 'label';
+            label.textContent = pct != null ? t('renderer.uploadingPercent', { pct }) : t('renderer.preparingUpload');
+            label.style.fontWeight = '600';
+            overlay.appendChild(label);
+            const barWrap = document.createElement('div');
+            barWrap.style.width = '80%';
+            barWrap.style.height = '6px';
+            barWrap.style.borderRadius = '999px';
+            barWrap.style.background = 'rgba(255,255,255,0.25)';
+            const bar = document.createElement('div');
+            bar.dataset.role = 'bar';
+            bar.style.height = '100%';
+            bar.style.borderRadius = '999px';
+            bar.style.background = '#22d3ee';
+            bar.style.width = `${pct != null ? pct : 10}%`;
+            bar.style.transition = 'width 0.2s ease';
+            barWrap.appendChild(bar);
+            overlay.appendChild(barWrap);
+            const cancelBtn = document.createElement('button');
+            cancelBtn.type = 'button';
+            cancelBtn.textContent = t('renderer.cancelUpload');
+            cancelBtn.className = 'upload-cancel-btn';
+            Object.assign(cancelBtn.style, {
+                background: 'rgba(0,0,0,0.55)',
+                color: '#fff',
+                border: '1px solid rgba(255,255,255,0.35)',
+                padding: '8px 12px',
+                borderRadius: '10px',
+                cursor: 'pointer',
+                fontSize: '13px'
+            });
+            overlay.appendChild(cancelBtn);
+            cancelBtn.addEventListener('click', (event) => {
+                event.preventDefault();
+                event.stopPropagation();
+                this.callbacks.onCancelUpload?.(msgId, overlay);
+            });
+        }
+        if (!existing) target.appendChild(overlay);
+    }
+
+    /**
+     * Render a video download/play overlay on top of the preview thumbnail.
+     * States: 'idle' (show play button) | 'downloading' (show progress).
+     * No 'ready' state — each play triggers a fresh download/stream to avoid
+     * storing large video blobs in memory.
+     */
+    renderVideoOverlay(wrapper, media, msgId) {
+        if (!wrapper || !media) return;
+        const target = wrapper.querySelector('.message-file-preview');
+        if (!target) return;
+        target.style.position = 'relative';
+        const existing = target.querySelector('.video-action-overlay');
+
+        // Don't show during upload
+        if (media.uploading) {
+            if (existing) existing.remove();
+            return;
+        }
+
+        const state = media._videoState || 'idle';
+        const overlay = existing || document.createElement('div');
+        overlay.className = 'video-action-overlay';
+        Object.assign(overlay.style, {
+            position: 'absolute',
+            inset: '0',
+            display: 'flex',
+            flexDirection: 'column',
+            alignItems: 'center',
+            justifyContent: 'center',
+            gap: '6px',
+            borderRadius: getComputedStyle(target).borderRadius || '12px',
+            pointerEvents: 'auto',
+            padding: '10px',
+            textAlign: 'center',
+            transition: 'background 0.2s ease'
+        });
+        overlay.innerHTML = '';
+
+        if (state === 'downloading') {
+            overlay.style.background = 'rgba(15,23,42,0.78)';
+            overlay.style.color = '#fff';
+            const pct = Math.round(media._videoProgress || 0);
+            const label = document.createElement('div');
+            label.textContent = t('renderer.downloading', { pct });
+            label.style.fontWeight = '600';
+            label.style.fontSize = '13px';
+            overlay.appendChild(label);
+            const barWrap = document.createElement('div');
+            Object.assign(barWrap.style, {
+                width: '80%', height: '6px', borderRadius: '999px',
+                background: 'rgba(255,255,255,0.25)'
+            });
+            const bar = document.createElement('div');
+            Object.assign(bar.style, {
+                height: '100%', borderRadius: '999px',
+                background: '#22d3ee', width: `${pct}%`,
+                transition: 'width 0.15s ease'
+            });
+            barWrap.appendChild(bar);
+            overlay.appendChild(barWrap);
+        } else {
+            // idle — show play button (every click triggers a fresh download/stream)
+            overlay.style.background = 'rgba(15,23,42,0.38)';
+            overlay.style.color = '#fff';
+            const btn = document.createElement('button');
+            btn.type = 'button';
+            btn.className = 'video-play-btn';
+            btn.innerHTML = '<svg viewBox="0 0 48 48" width="44" height="44" fill="currentColor" style="pointer-events:none"><path d="M18 12v24l18-12z"/></svg>';
+            Object.assign(btn.style, {
+                background: 'rgba(0,0,0,0.45)',
+                border: '2px solid rgba(255,255,255,0.6)',
+                borderRadius: '50%',
+                width: '52px', height: '52px',
+                display: 'flex', alignItems: 'center', justifyContent: 'center',
+                cursor: 'pointer', color: '#fff',
+                zIndex: '5'
+            });
+            btn.addEventListener('click', (e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                // Unified play: always triggers fresh download/stream
+                this.callbacks.onDownloadVideo?.(media, msgId);
+            });
+            overlay.appendChild(btn);
+            if (Number.isFinite(media.size) && media.size > 0) {
+                const sizeLabel = document.createElement('div');
+                sizeLabel.textContent = formatBytes(media.size);
+                sizeLabel.style.fontSize = '11px';
+                sizeLabel.style.opacity = '0.9';
+                overlay.appendChild(sizeLabel);
+            }
+        }
+        if (!existing) target.appendChild(overlay);
+    }
+
+    renderMediaBubble(bubble, msg) {
+        const media = msg.media || {};
+        // Tag media with message-level identifiers for preview backfill
+        if (!media._messageId) media._messageId = msg?.id || msg?.messageId || null;
+        if (!media._conversationId) media._conversationId = msg?.conversationId || null;
+        bubble.classList.add('message-has-media');
+        bubble.innerHTML = '';
+        const wrapper = document.createElement('div');
+        wrapper.className = 'message-file';
+        const preview = document.createElement('div');
+        const info = document.createElement('div');
+        info.className = 'message-file-info';
+        const nameEl = document.createElement('div');
+        nameEl.className = 'message-file-name';
+        nameEl.textContent = media.name || t('common.attachment');
+        const metaEl = document.createElement('div');
+        metaEl.className = 'message-file-meta';
+        metaEl.textContent = formatFileMeta(media);
+        info.appendChild(nameEl);
+        info.appendChild(metaEl);
+        wrapper.appendChild(preview);
+        wrapper.appendChild(info);
+
+        // For videos, use the download/play overlay instead of direct preview interaction.
+        // All videos start in 'idle' state — no blobs are stored in memory.
+        // Each click triggers a fresh download/stream.
+        const isVideo = (media.contentType || '').toLowerCase().startsWith('video/');
+        const needsVideoOverlay = isVideo && !media.uploading;
+        if (needsVideoOverlay && !media._videoState) {
+            media._videoState = 'idle';
+        }
+        if (!needsVideoOverlay) {
+            this.enableMediaPreviewInteraction(wrapper, media);
+        }
+
+        // Expired / unavailable indicator
+        if (media._expired) {
+            const expiredTag = document.createElement('div');
+            expiredTag.className = 'message-file-expired';
+            expiredTag.innerHTML = `<svg viewBox="0 0 20 20" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="10" cy="10" r="8"/><line x1="6" y1="6" x2="14" y2="14"/></svg> ${t('renderer.fileExpired')}`;
+            wrapper.appendChild(expiredTag);
+        }
+
+        // Save-to-drive button (only for non-uploading, non-expired media with valid source; skip videos)
+        const hasSource = !!(media.objectKey && media.envelope) || !!(media.chunked && media.baseKey && media.manifestEnvelope);
+        if (hasSource && !media.uploading && !media._expired && !isVideo) {
+            const actions = document.createElement('div');
+            actions.className = 'message-file-actions';
+            const saveBtn = document.createElement('button');
+            saveBtn.type = 'button';
+            saveBtn.className = 'message-file-save-drive';
+            saveBtn.innerHTML = `<svg viewBox="0 0 20 20" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M17 13v3a1.5 1.5 0 01-1.5 1.5h-11A1.5 1.5 0 013 16v-3"/><polyline points="7 7 10 3 13 7"/><line x1="10" y1="3" x2="10" y2="13"/></svg> ${t('renderer.saveToCloud')}`;
+            saveBtn.addEventListener('click', (e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                this.callbacks.onSaveToDrive?.(media);
+            });
+            actions.appendChild(saveBtn);
+            wrapper.appendChild(actions);
+        }
+
+        bubble.appendChild(wrapper);
+        this.attachMediaPreview(preview, media);
+
+        // Pass msg.id or normalized id for fallback
+        const messageId = normalizeTimelineMessageId(msg);
+        if (messageId) bubble.dataset.messageId = messageId;
+
+        this.renderUploadOverlay(wrapper, media, messageId);
+
+        if (needsVideoOverlay) {
+            this.renderVideoOverlay(wrapper, media, messageId);
+        }
+    }
+
+    render(entries, { state, contacts, visibleStatusSet, shimmerIds, forceFullRender }) {
+        if (!this.listEl) return;
+        const { activePeerDigest, activePeerDeviceId, conversationId } = state;
+        this.shimmerIds = shimmerIds || new Set();
+
+        // Clear list — disconnect observer to release references to old elements
+        if (this._previewObserver) { this._previewObserver.disconnect(); this._previewObserver = null; }
+        this._previewLoadedSet = new WeakSet();
+        this._pendingObserve = [];
+        const prevCount = this.listEl.childElementCount;
+        this.listEl.innerHTML = '';
+
+        let prevTs = null;
+        let prevDateKey = null;
+
+        for (let i = 0; i < entries.length; i += 1) {
+            const msg = entries[i];
+            const tsRaw = msg?.ts;
+            let tsVal = Number.isFinite(Number(tsRaw)) ? Number(tsRaw) : null;
+
+            // Normalize to seconds if input appears to be milliseconds
+            if (tsVal && tsVal > 1e11) {
+                tsVal = tsVal / 1000;
+            }
+
+            const hasTs = Number.isFinite(tsVal);
+            const dateKey = hasTs ? new Date(tsVal * 1000).toDateString() : null;
+
+            if (hasTs) {
+                const needSeparator = prevTs === null
+                    || prevDateKey !== dateKey
+                    || (tsVal - prevTs) >= 300; // 5 minutes in seconds
+                if (needSeparator) {
+                    const sep = document.createElement('li');
+                    sep.className = 'message-separator';
+                    sep.textContent = formatTimestamp(tsVal);
+                    this.listEl.appendChild(sep);
+                }
+                prevTs = tsVal;
+                prevDateKey = dateKey;
+            }
+
+            const li = document.createElement('li');
+            const messageType = msg.msgType || msg.subtype || (msg.media ? 'media' : 'text');
+            if (!msg.msgType) msg.msgType = messageType;
+
+            if (messageType === 'conversation-deleted') {
+                const sep = document.createElement('li');
+                sep.className = 'message-separator';
+                sep.style.marginTop = '12px';
+                sep.style.marginBottom = '12px';
+
+                // Format: "XXXX 已於 YYYY-MM-DD HH:MM 清除上方對話紀錄"
+                // Need to resolve sender name. 
+                // We have 'msg.senderDigest' or 'msg.header.sender_digest'.
+                const senderDigest = normalizeAccountDigest(msg.senderDigest || msg.header?.sender_digest);
+                let senderName = t('common.other');
+                if (isOutgoingFromSelf(msg, state.activePeerDigest)) { // Actually selfDigest not available in state directly?
+                    // Renderer doesn't know selfDigest easily without args.
+                    // But `isOutgoingFromSelf` is exported. We need `selfDigest`.
+                    // It's not passed in render() options except maybe implicitly?
+                    // Wait, render() has `contacts`.
+                    // Let's use `msg.direction`.
+                    if (msg.direction === 'outgoing') senderName = t('common.you');
+                    else {
+                        const contact = contacts?.get(senderDigest);
+                        if (contact?.nickname) senderName = contact.nickname;
+                    }
+                } else if (msg.direction === 'outgoing') {
+                    senderName = t('common.you');
+                }
+
+                // Timestamp – normalise: msg.ts may be seconds or milliseconds
+                let rawTs = Number(msg.ts);
+                if (Number.isFinite(rawTs) && rawTs > 10_000_000_000) rawTs = Math.floor(rawTs / 1000);
+                const tsMs = msg.tsMs || (Number.isFinite(rawTs) && rawTs > 0 ? rawTs * 1000 : Date.now());
+                const timeStr = new Date(tsMs).toLocaleString('zh-TW', { hour12: false, year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' });
+
+                sep.textContent = t('renderer.clearedHistory', { sender: senderName, time: timeStr });
+                this.listEl.appendChild(sep);
+                continue;
+            }
+
+            if (messageType === 'profile-update') {
+                const sep = document.createElement('li');
+                sep.className = 'message-separator';
+                sep.style.marginTop = '12px';
+                sep.style.marginBottom = '12px';
+                sep.textContent = msg.text || msg.content?.text || t('renderer.updatedProfile');
+                this.listEl.appendChild(sep);
+                continue;
+            }
+
+            if (messageType === 'contact-share') {
+                const sep = document.createElement('li');
+                sep.className = 'message-separator';
+                sep.style.marginTop = '12px';
+                sep.style.marginBottom = '12px';
+
+                // Parse contact-share payload to determine reason
+                let csPayload = null;
+                try {
+                  const rawText = msg?.text || '';
+                  if (typeof rawText === 'string' && rawText.trim().startsWith('{')) {
+                    csPayload = JSON.parse(rawText);
+                  }
+                } catch {}
+
+                const csReason = csPayload?.reason || msg?.reason || 'invite-consume';
+                const contact = typeof contacts?.get === 'function' ? contacts.get(activePeerDigest || '') : null;
+                const name = escapeHtml(contact?.nickname || csPayload?.nickname || t('common.other'));
+                const isOutgoing = msg?.direction === 'outgoing';
+
+                if (csReason === 'invite-consume' || csReason === 'invite-create') {
+                  sep.textContent = t('renderer.secureConnectionEstablished', { name });
+                } else if (csReason === 'nickname') {
+                  sep.textContent = isOutgoing ? t('profile.youUpdatedNickname') : t('profile.peerUpdatedNickname', { name });
+                } else if (csReason === 'avatar') {
+                  sep.textContent = isOutgoing ? t('profile.youUpdatedAvatar') : t('profile.peerUpdatedAvatar', { name });
+                } else {
+                  sep.textContent = isOutgoing ? t('profile.youUpdatedProfile') : t('profile.peerUpdatedProfile', { name });
+                }
+                this.listEl.appendChild(sep);
+                continue;
+            }
+
+            // Placeholder
+            if (msg.placeholder === true || messageType === 'placeholder') {
+                li.className = 'message-placeholder-item';
+                const row = document.createElement('div');
+                row.className = 'message-row message-placeholder-row';
+                const isOutgoing = msg.direction === 'outgoing';
+                if (isOutgoing) row.style.justifyContent = 'flex-end';
+
+                const bubble = document.createElement('div');
+                const messageId = normalizeTimelineMessageId(msg);
+                bubble.className = 'message-bubble message-placeholder';
+                if (messageId) bubble.dataset.messageId = messageId;
+                if (isOutgoing) bubble.classList.add('placeholder-outgoing');
+                else bubble.classList.add('placeholder-incoming');
+
+                const status = msg.status === 'failed'
+                    ? 'failed'
+                    : (msg.status === 'blocked' ? 'blocked' : 'pending');
+
+                if (status === 'failed' || status === 'blocked') {
+                    bubble.classList.add('placeholder-failed');
+                } else if (messageId && this.shimmerIds.has(messageId)) {
+                    bubble.classList.add('placeholder-shimmer');
+                }
+
+                bubble.textContent = status === 'failed'
+                    ? PLACEHOLDER_FAILED_TEXT
+                    : (status === 'blocked' ? PLACEHOLDER_BLOCKED_TEXT : (PLACEHOLDER_TEXT || ''));
+
+                row.appendChild(bubble);
+                li.appendChild(row);
+                this.listEl.appendChild(li);
+                try {
+                    // Log append if logMsgEvent is accessible, but here I can't access closure logUiAppend
+                    // I will assume logMsgEvent imported is sufficient or skip detailed log here
+                } catch { }
+                continue;
+            }
+
+
+
+
+
+            if (messageType === 'call-log') {
+                // [FIX] Reconstruct callLog on-the-fly if missing.
+                // Some code paths (vault-replay edge cases, offline sync) may store the
+                // timeline entry with msgType='call-log' but without the pre-built callLog
+                // object, causing the tombstone to silently fall through to standard text
+                // rendering (invisible to the user).
+                let callLogObj = msg.callLog || null;
+                if (!callLogObj) {
+                    try {
+                        const raw = msg.text || '';
+                        const parsed = (typeof raw === 'string' && raw.trim().startsWith('{'))
+                            ? JSON.parse(raw) : {};
+                        const normalized = normalizeCallLogPayload(parsed, msg.meta || {});
+                        const vr = resolveViewerRole(normalized.authorRole, msg.direction || 'incoming');
+                        const desc = describeCallLogForViewer(normalized, vr);
+                        callLogObj = { ...normalized, viewerRole: vr, label: desc.label, subLabel: desc.subLabel };
+                    } catch {
+                        callLogObj = { outcome: 'missed', kind: 'voice', durationSeconds: 0, authorRole: 'outgoing' };
+                    }
+                }
+                li.className = 'call-log-entry';
+                const chip = document.createElement('div');
+                const outcome = callLogObj.outcome || 'missed';
+                const callKind = callLogObj.kind || 'voice';
+                chip.className = `call-log-chip ${outcome}`;
+                chip.style.cursor = 'pointer';
+
+                const icon = document.createElement('span');
+                icon.className = 'call-log-icon';
+                icon.innerHTML = callKind === 'video' ? CALL_LOG_VIDEO_ICON : CALL_LOG_PHONE_ICON;
+                chip.appendChild(icon);
+
+                const textGroup = document.createElement('div');
+                textGroup.className = 'call-log-text-group';
+
+                const main = document.createElement('div');
+                main.className = 'call-log-main';
+
+                const viewerRole = callLogObj.viewerRole || resolveViewerRole(callLogObj.authorRole, msg.direction);
+                const { label, subLabel } = describeCallLogForViewer(callLogObj, viewerRole);
+
+                main.textContent = label || t('calls.voiceCall');
+                textGroup.appendChild(main);
+
+                if (subLabel) {
+                    const sub = document.createElement('div');
+                    sub.className = 'call-log-sub';
+                    sub.textContent = subLabel;
+                    textGroup.appendChild(sub);
+                }
+
+                chip.appendChild(textGroup);
+
+                // Click-to-redial: clicking a call-log chip initiates a call of the same type
+                chip.addEventListener('click', () => {
+                    if (this.callbacks.onCallLogRedial) {
+                        this.callbacks.onCallLogRedial({ kind: callKind, msg });
+                    }
+                });
+
+                li.appendChild(chip);
+                this.listEl.appendChild(li);
+                continue;
+            }
+
+
+
+            if (messageType === 'system') {
+                li.className = 'message-separator';
+                li.textContent = msg.text || msg.content?.text || '';
+                this.listEl.appendChild(li);
+                continue;
+            }
+
+            if (messageType === 'biz-conv-tombstone') {
+                li.className = 'message-separator biz-conv-tombstone-msg';
+                li.textContent = msg.text || msg.content?.text || '';
+                this.listEl.appendChild(li);
+                continue;
+            }
+
+            // Standard Message Row
+            const row = document.createElement('div');
+            row.className = 'message-row';
+            if (msg.direction === 'outgoing') {
+                row.style.justifyContent = 'flex-end';
+            }
+
+            if (msg.direction === 'incoming') {
+                const avatar = document.createElement('div');
+                avatar.className = 'message-avatar';
+                // Resolve contact from passed-in map/function
+                const contact = typeof contacts?.get === 'function'
+                    ? contacts.get(activePeerDigest || '')
+                    : null;
+
+                const name = contact?.nickname || '';
+                const initials = name ? name.slice(0, 1) : t('common.friend');
+
+                avatar.textContent = initials;
+                const avatarUrl = resolveContactAvatarUrl(contact);
+                if (avatarUrl) {
+                    const img = document.createElement('img');
+                    img.src = avatarUrl;
+                    img.alt = name || 'avatar';
+                    avatar.textContent = '';
+                    avatar.appendChild(img);
+                    avatar.classList.add('message-avatar-clickable');
+                    avatar.addEventListener('click', (e) => {
+                        e.stopPropagation();
+                        this.callbacks.onAvatarClick?.({ avatarUrl, name });
+                    });
+                }
+                row.appendChild(avatar);
+            } else {
+                row.style.gap = '0';
+            }
+
+            const bubble = document.createElement('div');
+            const messageId = normalizeTimelineMessageId(msg);
+            const isReplayEntry = msg?.isHistoryReplay === true;
+            bubble.className = 'message-bubble ' + (msg.direction === 'outgoing' ? 'message-me' : 'message-peer');
+            if (messageId) bubble.dataset.messageId = messageId;
+
+            const shouldReveal = messageId
+                && (isReplayEntry
+                    ? consumeReplayPlaceholderReveal(conversationId, messageId)
+                    : consumeGapPlaceholderReveal(conversationId, messageId));
+
+            if (shouldReveal) {
+                bubble.classList.add('message-reveal');
+                if (Number.isFinite(PLACEHOLDER_REVEAL_MS)) {
+                    bubble.style.animationDuration = `${PLACEHOLDER_REVEAL_MS}ms`;
+                }
+            }
+
+            if (messageType === 'media' && msg.media) {
+                this.renderMediaBubble(bubble, msg);
+            } else if (msg._ephImage) {
+                // Inline ephemeral image (DR-encrypted, no R2)
+                const imgWrap = document.createElement('div');
+                imgWrap.className = 'eph-inline-image';
+                const imgEl = document.createElement('img');
+                imgEl.src = msg._ephImage;
+                imgEl.alt = msg.text || 'Image';
+                imgEl.loading = 'lazy';
+                imgEl.addEventListener('click', () => {
+                    this.callbacks.onEphImageClick?.({ url: msg._ephImage, name: msg.text || 'Image' });
+                });
+                imgWrap.appendChild(imgEl);
+                bubble.appendChild(imgWrap);
+                bubble.classList.add('message-has-media');
+            } else {
+                bubble.textContent = msg.text || msg.error || t('renderer.cannotDecrypt');
+            }
+
+            row.appendChild(bubble);
+            li.appendChild(row);
+
+            // Meta Row
+            const metaRow = document.createElement('div');
+            metaRow.className = 'message-meta';
+            const tsSpan = document.createElement('span');
+            tsSpan.className = 'message-ts hidden';
+            tsSpan.textContent = '';
+            metaRow.appendChild(tsSpan);
+
+
+            const RETRY_ICON = '<svg viewBox="0 0 24 24" fill="none" class="w-4 h-4" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" /></svg>';
+            // Lucide-style SVG status icons (14×14, inline)
+            const ICON_CHECK = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>';
+            const ICON_CHECK_CHECK = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6 7 17l-5-5"/><path d="m22 10-9.17 9.17L11 17.34"/></svg>';
+            const ICON_CIRCLE_ALERT = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>';
+
+            if (messageType !== 'call-log') {
+                const statusSpan = document.createElement('span');
+                const status = typeof msg?.status === 'string' ? msg.status : null;
+                const pending = status === 'pending' || msg.pending === true;
+                const failed = status === 'failed';
+                const statusMessageId = msg?.id || msg?.messageId || msg?.localId || null;
+                const isOutgoing = msg.direction === 'outgoing';
+                const showStatus = !!(statusMessageId && visibleStatusSet && visibleStatusSet.has(statusMessageId));
+
+                // Determine delivery status locally for rendering icon
+                const vaultCount = Number(msg.vaultPutCount);
+                const countDelivered = Number.isFinite(vaultCount) && vaultCount >= 2;
+                const msgCounter = resolveRenderEntryCounter(msg);
+                const ackCounter = (conversationId && typeof getVaultAckCounter === 'function') ? getVaultAckCounter(conversationId) : null;
+                const legacyDelivered = Number.isFinite(msgCounter) && Number.isFinite(ackCounter) && ackCounter >= msgCounter;
+
+                const delivered = countDelivered || legacyDelivered || msg.status === 'delivered' || msg.status === 'read';
+
+                if (statusMessageId) statusSpan.dataset.messageId = statusMessageId;
+
+                // Helper to detect network errors
+                const isNetworkError = (msg) => {
+                    const code = msg?.failureCode || '';
+                    const status = msg?.failureStatus || msg?.status || 0;
+                    // Check for HTTP 5xx or specific network codes
+                    if (Number(code) >= 500 && Number(code) < 600) return true;
+                    if (String(code).startsWith('HTTP_5')) return true;
+                    if (String(code).includes('Timeout')) return true;
+                    if (String(code) === 'NetworkError') return true;
+                    if (String(code) === 'FetchError') return true;
+                    return false;
+                };
+
+                if (msg.direction === 'incoming') {
+                    statusSpan.className = 'message-status peer';
+                    statusSpan.textContent = '';
+                } else if (failed) {
+                    const retryable = isNetworkError(msg);
+                    if (retryable) {
+                        statusSpan.className = 'message-status failed retryable';
+                        statusSpan.dataset.retry = 'true';
+                        statusSpan.innerHTML = RETRY_ICON; // Use SVG
+                        statusSpan.title = t('messages.networkSendFailed');
+                    } else {
+                        statusSpan.className = 'message-status failed';
+                        statusSpan.innerHTML = ICON_CIRCLE_ALERT;
+                        const failureTip = msg?.failureReason || msg?.failureCode || '';
+                        if (failureTip) statusSpan.title = failureTip;
+                    }
+                } else if (!showStatus) {
+                    statusSpan.className = 'message-status hidden';
+                    statusSpan.textContent = '';
+                } else if (pending) {
+                    console.log('[Renderer] Render Pending:', {
+                        id: msg.id,
+                        status: msg.status,
+                        pendingProp: msg.pending,
+                        isPendingVar: pending,
+                        direction: msg.direction
+                    });
+                    statusSpan.className = 'message-status pending';
+
+                    statusSpan.innerHTML = '<span class="status-spinner"></span>';
+
+                } else if (delivered) {
+                    statusSpan.className = 'message-status delivered';
+                    statusSpan.innerHTML = ICON_CHECK_CHECK;
+                } else {
+                    statusSpan.className = 'message-status sent';
+                    statusSpan.innerHTML = ICON_CHECK;
+                }
+                metaRow.appendChild(statusSpan);
+            }
+            li.appendChild(metaRow);
+            this.listEl.appendChild(li);
+        }
+    }
+}
+
+

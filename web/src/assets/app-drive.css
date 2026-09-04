@@ -1,0 +1,477 @@
+.drive-usage {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 14px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--bg-surface);
+  margin: 0 0 10px;
+}
+
+.drive-usage-label {
+  font-size: 12px;
+  color: #94a3b8;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.drive-usage-amount {
+  display: flex;
+  align-items: baseline;
+  gap: 4px;
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--fg);
+  white-space: nowrap;
+}
+
+.drive-usage-total {
+  color: #94a3b8;
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.drive-usage-bar {
+  position: relative;
+  flex: 1;
+  min-width: 48px;
+  height: 6px;
+  border-radius: 999px;
+  background: rgba(148, 163, 184, 0.24);
+  overflow: hidden;
+}
+
+.drive-usage-bar-fill {
+  position: absolute;
+  inset: 0;
+  width: 0%;
+  background: linear-gradient(90deg, #0ea5e9, #6366f1, #a855f7);
+  transition: width .28s ease;
+}
+
+.drive-usage-bar-fill.alert {
+  background: linear-gradient(90deg, #f97316, #ef4444);
+}
+
+.drive-usage-percent {
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--fg);
+  white-space: nowrap;
+}
+
+.list {
+  list-style: none;
+  padding-left: 0;
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+#driveList {
+  padding-bottom: calc(var(--navbar-height) + 16px);
+}
+
+.file-item {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 0;
+  padding: 0;
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  background: var(--bg-surface);
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.2);
+  transition: transform .15s ease, box-shadow .15s ease;
+  cursor: pointer;
+  outline: none;
+  overflow: hidden;
+  touch-action: pan-y;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.file-item * {
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.file-item.folder {
+  background: var(--bg-elevated);
+}
+
+.file-item:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 12px 28px rgba(0, 0, 0, 0.25);
+}
+
+.file-item:focus-visible {
+  box-shadow: 0 0 0 2px rgba(56, 189, 248, 0.35);
+  transform: none;
+}
+
+.file-item .item-content {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 16px 18px;
+  width: 100%;
+  transition: transform .18s ease;
+}
+
+.file-item .meta {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  flex: 1;
+  min-width: 0;
+}
+
+.file-item .meta .name {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 600;
+  font-size: 15px;
+  color: var(--fg);
+  min-width: 0;
+}
+
+.file-item .meta .name .label {
+  display: block;
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.file-item .meta .name i,
+.file-item .meta .name .icon {
+  font-size: 20px;
+}
+
+.file-item.folder .meta .name i,
+.file-item.folder .meta .name .icon {
+  color: #f59e0b;
+}
+
+.file-thumb {
+  width: 36px;
+  height: 36px;
+  flex: 0 0 36px;
+  border-radius: 10px;
+  background: rgba(22, 163, 74, 0.15);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.file-thumb i,
+.file-thumb .icon {
+  font-size: 20px;
+  color: #16a34a;
+}
+
+.file-item .sub {
+  color: #94a3b8;
+  font-size: 12px;
+  letter-spacing: 0.3px;
+}
+
+.file-item .item-delete {
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: 72px;
+  border: none;
+  background: #ef4444;
+  color: #fff;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 22px;
+  cursor: pointer;
+  pointer-events: none;
+  transition: opacity .18s ease;
+  opacity: 0;
+}
+
+.file-item .item-delete i,
+.file-item .item-delete .icon {
+  pointer-events: none;
+}
+
+.file-item.show-delete .item-content {
+  transform: translateX(-72px);
+}
+
+.file-item.show-delete .item-delete {
+  pointer-events: auto;
+  opacity: 1;
+}
+
+.file-item .item-delete:active {
+  transform: translateY(1px);
+}
+
+.empty-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  padding: 40px 20px 36px;
+  text-align: center;
+}
+
+.empty-state > i,
+.empty-state > .icon {
+  font-size: 44px;
+  color: #94a3b8;
+  margin-bottom: 4px;
+}
+
+.empty-state-title {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--fg);
+}
+
+.empty-state-hint {
+  margin: 0;
+  font-size: 13px;
+  color: #94a3b8;
+}
+
+.empty-state-btn {
+  margin-top: 10px;
+  padding: 8px 20px;
+  border: none;
+  border-radius: 10px;
+  background: linear-gradient(135deg, #2563eb, #1d4ed8);
+  color: #fff;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  box-shadow: 0 6px 16px rgba(37, 99, 235, 0.22);
+}
+
+.empty-state-btn:active {
+  transform: translateY(1px);
+}
+
+@keyframes shimmer {
+  0% { background-position: -200px 0; }
+  100% { background-position: 200px 0; }
+}
+
+.skeleton-item {
+  pointer-events: none;
+}
+
+.skeleton-bone {
+  display: inline-block;
+  border-radius: 6px;
+  background: linear-gradient(90deg, #334155 25%, #475569 50%, #334155 75%);
+  background-size: 400px 100%;
+  animation: shimmer 1.4s ease-in-out infinite;
+}
+
+.skeleton-icon {
+  width: 20px;
+  height: 20px;
+  border-radius: 6px;
+  flex: 0 0 20px;
+}
+
+.skeleton-text {
+  width: 55%;
+  height: 14px;
+}
+
+.skeleton-sub {
+  width: 40%;
+  height: 11px;
+}
+
+pre#out {
+  white-space: pre-wrap;
+  background: var(--bg-surface);
+  color: var(--fg);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 12px;
+  min-height: 120px;
+  font-size: 12px;
+}
+.modal.folder-modal .modal-panel {
+  width: min(360px, 92vw);
+  max-height: none;
+}
+
+.modal.folder-modal .modal-body {
+  background: var(--bg);
+  padding: 22px 24px;
+}
+
+.modal.folder-modal .modal-close {
+  display: none;
+}
+
+.folder-form {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  width: 100%;
+}
+
+.folder-form label {
+  font-size: 13px;
+  color: var(--fg);
+  font-weight: 600;
+}
+
+.folder-form input {
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 12px;
+  font-size: 14px;
+  background: var(--bg-surface);
+  color: var(--fg);
+}
+
+.folder-hint {
+  margin: 0;
+  font-size: 12px;
+  color: #94a3b8;
+}
+
+.folder-error {
+  margin: 0;
+  font-size: 12px;
+  color: #fca5a5;
+  min-height: 16px;
+}
+
+.folder-actions {
+  margin-top: 6px;
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+}
+
+.folder-actions button {
+  min-width: 88px;
+}
+
+.modal.upload-modal .modal-panel {
+  width: min(420px, 92vw);
+  max-height: none;
+}
+
+.modal.upload-modal .modal-body {
+  background: var(--bg);
+  padding: 22px 24px;
+}
+
+.upload-form {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.upload-field {
+  position: relative;
+  border: 1px dashed var(--line);
+  border-radius: 14px;
+  background: var(--bg-surface);
+  overflow: hidden;
+}
+
+.upload-input {
+  position: absolute;
+  inset: 0;
+  opacity: 0;
+  cursor: pointer;
+  z-index: 2;
+}
+
+.upload-callout {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 22px 18px;
+  color: var(--fg);
+  font-size: 14px;
+  font-weight: 600;
+  pointer-events: none;
+}
+
+.upload-callout i,
+.upload-callout .icon {
+  font-size: 28px;
+  color: #38bdf8;
+}
+
+.upload-name {
+  font-size: 13px;
+  color: #94a3b8;
+  letter-spacing: 0.3px;
+  margin-top: 6px;
+}
+
+.upload-hint {
+  margin: 0;
+  font-size: 12px;
+  color: #94a3b8;
+}
+
+.upload-error {
+  margin: 0;
+  font-size: 12px;
+  color: #fca5a5;
+  min-height: 16px;
+}
+
+.upload-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+}
+
+.upload-actions button {
+  min-width: 92px;
+}
+
+.preview-message {
+  padding: 24px 16px;
+  text-align: center;
+  color: #94a3b8;
+  font-size: 14px;
+  letter-spacing: 0.2px;
+}
+
+.preview-download {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 10px 20px;
+  border-radius: 12px;
+  background: linear-gradient(135deg, #0f172a, #1e293b);
+  color: #fff;
+  font-size: 14px;
+  font-weight: 600;
+  text-decoration: none;
+  box-shadow: 0 10px 24px rgba(15, 23, 42, 0.2);
+  cursor: pointer;
+}
+
+.preview-download:active {
+  transform: translateY(1px);
+}

@@ -1,0 +1,1090 @@
+/**
+ * ConversationListController
+ * Manages conversation list rendering, pull-to-refresh, and interaction.
+ */
+
+import { BaseController } from './base-controller.js';
+import { normalizePeerKey, splitPeerKey, resolveReadyContactCoreEntry, isCoreVaultReady, listReadyContacts, upsertContactCore } from '../contact-core-store.js';
+import { normalizeAccountDigest, normalizePeerDeviceId } from '../../../core/store.js';
+import { restorePendingInvites } from '../session-store.js';
+import { escapeHtml, resolveMessagePreview, updateThreadPreview, formatThreadPreview } from '../ui-utils.js';
+import { applyAvatarBadge } from '../components/avatar-badge.js';
+import { normalizeTimelineMessageId, extractMessageTimestampMs, normalizeMsgTypeValue, deriveMessageDirectionFromEnvelopeMeta } from '../../../features/messages/parser.js';
+import { getLocalProcessedCounter } from '../../../features/messages-flow/local-counter.js'; // [FIX] Import unread counter logic
+import { listSecureMessages as apiListSecureMessages, batchLatestMessages } from '../../../api/messages.js';
+import { getMessagesUnreadCount } from '../../../features/messages-flow/server-api.js'; // [FIX] Backend Unread API
+import { t } from '/locales/index.js';
+
+const CONV_PULL_THRESHOLD = 60;
+const CONV_PULL_MAX = 100;
+
+/**
+ * Resolve parsed header from a server message item.
+ * Server returns header_json (string) not header (object).
+ */
+function resolveHeader(msg) {
+    if (!msg) return null;
+    let header = msg.header || null;
+    if (!header && typeof msg.header_json === 'string') {
+        try { header = JSON.parse(msg.header_json); } catch { return null; }
+    }
+    if (typeof header === 'string') {
+        try { header = JSON.parse(header); } catch { return null; }
+    }
+    return header && typeof header === 'object' ? header : null;
+}
+
+export class ConversationListController extends BaseController {
+    constructor(deps) {
+        super(deps);
+        this.conversationPullDistance = 0;
+        this.conversationPullTracking = false;
+        this.conversationPullDecided = false;
+        this.conversationPullStartY = 0;
+        this.conversationPullStartX = 0;
+        this.conversationPullInvalid = false;
+        this.conversationsRefreshing = false;
+        // Scroll-vs-tap detection: suppress click when user is scrolling
+        this._touchStartY = 0;
+        this._touchStartX = 0;
+        this._touchStartScroll = 0;
+        this._scrolledDuringTouch = false;
+    }
+
+    /**
+     * Ensure conversation index map exists and is restored from pending invites if needed.
+     */
+    ensureConversationIndex() {
+        if (!(this.deps.sessionStore.conversationIndex instanceof Map)) {
+            const entries = this.deps.sessionStore.conversationIndex && typeof this.deps.sessionStore.conversationIndex.entries === 'function'
+                ? Array.from(this.deps.sessionStore.conversationIndex.entries())
+                : [];
+            this.deps.sessionStore.conversationIndex = new Map(entries);
+        }
+        // We might need to track if restored locally in the controller instance
+        if (!this._conversationIndexRestored) {
+            this._conversationIndexRestored = true;
+            const pendingInvites = restorePendingInvites();
+            const nowSec = Date.now();
+            let restoredCount = 0;
+            const sampleConversationIdsPrefix8 = [];
+            if (pendingInvites instanceof Map) {
+                for (const entry of pendingInvites.values()) {
+                    const expiresAt = Number(entry?.expiresAt || 0);
+                    if (!Number.isFinite(expiresAt) || expiresAt <= nowSec) continue;
+                    const conversationId = typeof entry?.conversationId === 'string' ? entry.conversationId.trim() : '';
+                    const conversationToken = typeof entry?.conversationToken === 'string' ? entry.conversationToken.trim() : '';
+                    if (!conversationId || !conversationToken) continue;
+                    const ownerAccountDigest = normalizeAccountDigest(entry?.ownerAccountDigest || null);
+                    const ownerDeviceId = normalizePeerDeviceId(entry?.ownerDeviceId || null);
+                    const prev = this.deps.sessionStore.conversationIndex.get(conversationId) || {};
+                    const next = { ...prev };
+                    let changed = false;
+                    if (!prev.token_b64) {
+                        next.token_b64 = conversationToken;
+                        changed = true;
+                    }
+                    if (!prev.peerAccountDigest && ownerAccountDigest) {
+                        next.peerAccountDigest = ownerAccountDigest;
+                        changed = true;
+                    }
+                    if (!prev.peerDeviceId && ownerDeviceId) {
+                        next.peerDeviceId = ownerDeviceId;
+                        changed = true;
+                    }
+                    if (!changed) continue;
+                    this.deps.sessionStore.conversationIndex.set(conversationId, next);
+                    restoredCount += 1;
+                    if (sampleConversationIdsPrefix8.length < 3) {
+                        sampleConversationIdsPrefix8.push(conversationId.slice(0, 8));
+                    }
+                }
+            }
+            this.deps.logCapped?.('conversationIndexRestoredFromPending', {
+                restoredCount,
+                sampleConversationIdsPrefix8,
+                source: 'pendingInvites'
+            }, 5);
+        }
+        return this.deps.sessionStore.conversationIndex;
+    }
+
+    /**
+     * Get conversation threads map.
+     */
+    getThreads() {
+        if (!(this.deps.sessionStore.conversationThreads instanceof Map)) {
+            const entries = this.deps.sessionStore.conversationThreads && typeof this.deps.sessionStore.conversationThreads.entries === 'function'
+                ? Array.from(this.deps.sessionStore.conversationThreads.entries())
+                : [];
+            this.deps.sessionStore.conversationThreads = new Map(entries);
+        }
+        return this.deps.sessionStore.conversationThreads;
+    }
+
+    /**
+     * Upsert a conversation thread entry.
+     */
+    upsertThread({ peerAccountDigest, peerDeviceId = null, conversationId, tokenB64, nickname, avatar, lastMsgType = null }) {
+        const key = normalizePeerKey(peerAccountDigest);
+        const convId = String(conversationId || '').trim();
+        if (!key || !convId) return null;
+        if (this.deps.sessionStore.deletedConversations?.has?.(convId)) return null;
+
+        const threads = this.getThreads();
+        const prev = threads.get(convId) || {};
+        const { digest: digestFromKey, deviceId: deviceFromKey } = splitPeerKey(key);
+        const resolvedPeerDeviceId = normalizePeerDeviceId(peerDeviceId || deviceFromKey || prev.peerDeviceId || null);
+        const resolvedToken = tokenB64 || prev.conversationToken || null;
+
+        if (!resolvedPeerDeviceId || !resolvedToken) {
+            try { this.deps.log?.({ conversationThreadSkip: { convId, peerAccountDigest: key, reason: 'missing-core' } }); } catch { }
+            return prev || null;
+        }
+
+        if (!digestFromKey) {
+            // logContactCoreWriteSkip equivalent
+            if (this.deps.contactCoreVerbose) {
+                try {
+                    console.warn('[contact-core] ui:write-skip ' + JSON.stringify({
+                        reason: 'missing-digest',
+                        callsite: 'messages-pane:thread-upsert',
+                        conversationId: convId,
+                        hasDeviceId: !!resolvedPeerDeviceId
+                    }));
+                } catch { }
+            }
+            return prev || null;
+        }
+
+        upsertContactCore({
+            peerAccountDigest: digestFromKey,
+            peerDeviceId: resolvedPeerDeviceId,
+            conversationId: convId,
+            conversationToken: resolvedToken,
+            nickname: nickname || null,
+            avatar: avatar || null
+        }, 'messages-pane:thread-upsert');
+
+        const entry = {
+            ...prev,
+            peerAccountDigest: key,
+            peerDeviceId: resolvedPeerDeviceId,
+            conversationId: convId,
+            conversationToken: resolvedToken,
+            nickname: nickname || prev.nickname || null,
+            avatar: avatar || prev.avatar || null,
+            lastMessageText: typeof prev.lastMessageText === 'string' ? prev.lastMessageText : '',
+            lastMessageTs: typeof prev.lastMessageTs === 'number' ? prev.lastMessageTs : null,
+            lastMessageId: prev.lastMessageId || null,
+            lastMsgType: lastMsgType || prev.lastMsgType || null,
+            lastReadTs: typeof prev.lastReadTs === 'number' ? prev.lastReadTs : null,
+            unreadCount: typeof prev.unreadCount === 'number' ? prev.unreadCount : 0,
+            offlineUnreadCount: typeof prev.offlineUnreadCount === 'number' ? prev.offlineUnreadCount : 0,
+            previewLoaded: !!prev.previewLoaded,
+            needsRefresh: !!prev.needsRefresh
+        };
+        threads.set(convId, entry);
+        return entry;
+    }
+
+    /**
+     * Sync threads from ready contacts.
+     */
+    syncFromContacts() {
+        const threads = this.getThreads();
+        const contacts = Array.isArray(this.deps.sessionStore.contactState) ? this.deps.sessionStore.contactState : [];
+        const seen = new Set();
+
+        // Helper ensurePeerAccountDigest
+        const ensurePeerAccountDigest = (source) => {
+            if (!source || typeof source !== 'object') return null;
+            let raw = source.peerAccountDigest;
+            if (typeof raw === 'string') {
+                if (raw.includes('::')) {
+                    raw = raw.split('::')[0];
+                }
+                const digest = normalizeAccountDigest(raw);
+                if (digest) {
+                    source.peerAccountDigest = digest;
+                    return digest;
+                }
+            }
+            return null;
+        };
+
+        if (contacts.length > 0) {
+            console.log('[ConvList] syncFromContacts', { count: contacts.length });
+        }
+
+        for (const contact of contacts) {
+            const peerDigest = ensurePeerAccountDigest(contact);
+            const conversationId = contact?.conversation?.conversation_id;
+            const tokenB64 = contact?.conversation?.token_b64;
+            const peerDeviceId = contact?.conversation?.peerDeviceId || null;
+
+            if (!peerDigest || !conversationId || !tokenB64) {
+                if (this.deps.contactCoreVerbose || true) { // Force log for debug
+                    console.log('[ConvList] Skip contact', {
+                        nick: contact.nickname,
+                        hasDigest: !!peerDigest,
+                        hasConvId: !!conversationId,
+                        hasToken: !!tokenB64,
+                        rawDigest: contact.peerAccountDigest
+                    });
+                }
+                continue;
+            }
+            seen.add(conversationId);
+            this.upsertThread({
+                peerAccountDigest: peerDigest,
+                peerDeviceId,
+                conversationId,
+                tokenB64,
+                nickname: contact.nickname,
+                avatar: contact.avatar || null
+            });
+        }
+        for (const convId of Array.from(threads.keys())) {
+            const thread = threads.get(convId);
+            if (!seen.has(convId) && thread?.type !== 'biz-conv') threads.delete(convId);
+        }
+        return threads;
+    }
+
+    /**
+     * Resolve target device ID for a conversation.
+     */
+    resolveTargetDevice(conversationId, peerAccountDigest = null) {
+        const convId = String(conversationId || '').trim();
+        if (!convId) return null;
+        const threads = this.getThreads();
+        const thread = threads.get(convId) || null;
+        if (thread?.peerDeviceId) return thread.peerDeviceId;
+
+        const convIndex = this.ensureConversationIndex();
+        const convEntry = convIndex.get(convId) || null;
+        if (convEntry?.peerDeviceId) return convEntry.peerDeviceId;
+
+        if (convEntry?.peerAccountDigest && peerAccountDigest && convEntry.peerAccountDigest !== peerAccountDigest) {
+            return null;
+        }
+
+        const state = this.getMessageState();
+        if (state.activePeerDigest && (!peerAccountDigest || state.activePeerDigest === peerAccountDigest)) {
+            if (state.activePeerDeviceId) return state.activePeerDeviceId;
+        }
+        return null;
+    }
+
+    /**
+     * Refresh conversation previews by fetching latest messages.
+     */
+    async refreshPreviews({ force = false } = {}) {
+        const threadsMap = this.getThreads();
+        const threads = Array.from(threadsMap.values());
+
+        // Filter eligible threads
+        const eligible = threads.filter(thread => {
+            const peerDigest = this._threadPeer(thread);
+            if (!thread?.conversationId || !thread?.conversationToken || !peerDigest || !thread?.peerDeviceId) {
+                if (!thread?.peerDeviceId) {
+                    try { this.deps.log?.({ previewSkipMissingPeerDevice: thread?.conversationId || null }); } catch { }
+                }
+                return false;
+            }
+            if (!force && thread.previewLoaded && !thread.needsRefresh) return false;
+            return true;
+        });
+
+        if (!eligible.length) return;
+
+        if (this.deps.contactCoreVerbose) {
+            console.log(`[ConvList] refreshPreviews starting. Threads: ${eligible.length}`);
+        }
+        console.time('[ConvList] refreshPreviews duration');
+
+        const allConvIds = eligible.map(t => t.conversationId).filter(Boolean);
+        const selfDigest = this.deps.sessionStore?.accountDigest;
+
+        // [PERF] Single batch fetch: messages + unread counts in parallel
+        let batchMessages = {};
+        let unreadCountsMap = {};
+        try {
+            const [batchResult, unreadResult] = await Promise.all([
+                batchLatestMessages({ conversationIds: allConvIds, limit: 20 }),
+                selfDigest
+                    ? getMessagesUnreadCount({ conversationIds: allConvIds, selfAccountDigest: selfDigest })
+                    : Promise.resolve({ counts: {} })
+            ]);
+            batchMessages = batchResult?.data?.conversations || {};
+            unreadCountsMap = unreadResult?.counts || {};
+        } catch (err) {
+            console.warn('[ConvList] Batch preview fetch failed, falling back to individual', err);
+            // Fallback: fetch individually in chunks (original behavior)
+            await this._refreshPreviewsFallback(eligible, threadsMap, force);
+            console.timeEnd('[ConvList] refreshPreviews duration');
+            return;
+        }
+
+        // Process all results locally
+        for (const thread of eligible) {
+            try {
+                const convData = batchMessages[thread.conversationId];
+                const messages = convData?.items || [];
+
+                // Apply unread count
+                const backendCount = unreadCountsMap[thread.conversationId] || 0;
+                const currentThreadVal = threadsMap.get(thread.conversationId);
+                if (currentThreadVal) {
+                    currentThreadVal.unreadCount = backendCount;
+                    currentThreadVal.offlineUnreadCount = 0;
+                }
+
+                if (!messages.length) continue;
+
+                this._applyPreviewFromMessages(thread, messages, threadsMap);
+            } catch (err) {
+                console.error('Preview processing failed', err);
+            }
+        }
+
+        this.renderConversationList();
+        console.timeEnd('[ConvList] refreshPreviews duration');
+    }
+
+    /**
+     * Fallback: fetch previews individually in chunks (used when batch API fails).
+     */
+    async _refreshPreviewsFallback(eligible, threadsMap, force) {
+        const CHUNK_SIZE = 5;
+        const threadChunks = [];
+        for (let i = 0; i < eligible.length; i += CHUNK_SIZE) {
+            threadChunks.push(eligible.slice(i, i + CHUNK_SIZE));
+        }
+
+        for (const chunk of threadChunks) {
+            let unreadCountsMap = {};
+            try {
+                const chunkIds = chunk.map(t => t.conversationId).filter(Boolean);
+                const selfDigest = this.deps.sessionStore?.accountDigest;
+                if (chunkIds.length > 0 && selfDigest) {
+                    const res = await getMessagesUnreadCount({ conversationIds: chunkIds, selfAccountDigest: selfDigest });
+                    unreadCountsMap = res.counts || {};
+                }
+            } catch (err) {
+                console.warn('[ConvList] Batch unread fetch failed', err);
+            }
+
+            await Promise.all(chunk.map(async (thread) => {
+                try {
+                    if (typeof apiListSecureMessages !== 'function') return;
+                    const result = await apiListSecureMessages({
+                        conversationId: thread.conversationId,
+                        limit: 20
+                    });
+                    const messages = result?.data?.items || [];
+
+                    const backendCount = (unreadCountsMap && unreadCountsMap[thread.conversationId]) || 0;
+                    const currentThreadVal = threadsMap.get(thread.conversationId);
+                    if (currentThreadVal) {
+                        currentThreadVal.unreadCount = backendCount;
+                        currentThreadVal.offlineUnreadCount = 0;
+                    }
+
+                    if (!messages.length) return;
+                    this._applyPreviewFromMessages(thread, messages, threadsMap);
+                } catch (err) {
+                    console.error('Preview refresh failed', err);
+                }
+            }));
+            this.renderConversationList();
+        }
+    }
+
+    /**
+     * Extract preview text/metadata from a list of messages (DESC order) and apply to thread.
+     */
+    _applyPreviewFromMessages(thread, messages, threadsMap) {
+        // Deletion-Aware Preview Logic
+        // Messages are DESC (newest first). Find the newest conversation-deleted tombstone.
+        let tombstoneIndex = -1;
+        for (let i = 0; i < messages.length; i++) {
+            const payload = messages[i].payload || {};
+            let type = normalizeMsgTypeValue(payload.type);
+            if (!type) {
+                const header = resolveHeader(messages[i]);
+                type = normalizeMsgTypeValue(header?.meta?.msgType || header?.meta?.msg_type);
+            }
+            if (type === 'conversation-deleted') {
+                tombstoneIndex = i;
+                break;
+            }
+        }
+
+        const candidates = tombstoneIndex >= 0
+            ? messages.slice(0, tombstoneIndex)
+            : messages;
+        const isDeleted = tombstoneIndex >= 0 && candidates.length === 0;
+
+        let previewMsg = null;
+
+        for (const msg of candidates) {
+            const payload = msg.payload || {};
+            let type = normalizeMsgTypeValue(payload.type);
+            if (!type) {
+                const header = resolveHeader(msg);
+                type = normalizeMsgTypeValue(header?.meta?.msgType || header?.meta?.msg_type);
+            }
+
+            if (type === 'conversation-deleted') continue;
+
+            const isControl = type === 'sys' || type === 'system' || type === 'control' ||
+                (type && ['profile-update', 'session-init', 'session-ack',
+                    'session-error', 'read-receipt', 'delivery-receipt', 'placeholder'].includes(type));
+            if (isControl) continue;
+
+            if (type && ['text', 'media', 'call-log', 'call_log', 'contact-share'].includes(type)) {
+                previewMsg = msg;
+                break;
+            } else if (!type && msg.ciphertext_b64) {
+                previewMsg = msg;
+                break;
+            }
+        }
+
+        let text = t('messages.noMessages');
+        let type = null;
+        let ts = null;
+        let direction = null;
+
+        if (isDeleted) {
+            text = t('messages.noMessages');
+            type = 'conversation-deleted';
+            ts = tombstoneIndex >= 0 ? extractMessageTimestampMs(messages[tombstoneIndex]) : extractMessageTimestampMs(messages[0] || {});
+            const ct = threadsMap.get(thread.conversationId);
+            if (ct) { ct.unreadCount = 0; ct.offlineUnreadCount = 0; }
+        } else if (previewMsg) {
+            const payload = previewMsg.payload || {};
+            const meta = previewMsg.meta || {};
+            const header = resolveHeader(previewMsg);
+            const effectiveMeta = meta.sender ? meta : (header?.meta || {});
+
+            type = normalizeMsgTypeValue(payload.type || effectiveMeta.msgType || effectiveMeta.msg_type || 'text');
+            ts = extractMessageTimestampMs(previewMsg);
+
+            const senderDigest = previewMsg.sender_account_digest;
+            direction = senderDigest === this.deps.sessionStore.activePeerDigest ? 'incoming' : 'outgoing';
+
+            if (type === 'text') {
+                text = payload.text || (previewMsg.ciphertext_b64 ? t('messages.encryptedMessage') : t('messages.textMessage'));
+            } else if (type === 'media') {
+                const mime = (payload.contentType || payload.mimeType || '').toLowerCase();
+                if (mime.startsWith('image/')) {
+                    text = t('messages.imagePreview');
+                } else if (mime.startsWith('video/')) {
+                    text = t('messages.videoPreview');
+                } else {
+                    text = t('messages.filePreview', { name: payload.filename || payload.name || t('common.attachment') });
+                }
+            } else if (type === 'call_log' || type === 'call-log') {
+                const clKind = payload?.kind || previewMsg?.callLog?.kind || effectiveMeta?.call_kind || '';
+                text = clKind === 'video' ? t('calls.videoCallPreview') : t('calls.voiceCallPreview');
+            } else if (type === 'contact-share' || type === 'contact_share') {
+                const csReason = payload?.reason;
+                if (csReason === 'nickname') text = t('profile.updatedNickname');
+                else if (csReason === 'avatar') text = t('profile.updatedAvatar');
+                else if (csReason === 'profile' || csReason === 'update' || csReason === 'manual') text = t('profile.updatedProfile');
+                else text = t('messages.secureConnectionEstablished');
+            } else {
+                text = previewMsg.ciphertext_b64 ? t('messages.encryptedMessage') : t('messages.newMessage');
+            }
+        }
+
+        const currentThread = threadsMap.get(thread.conversationId);
+        if (!currentThread) return;
+
+        updateThreadPreview(currentThread, {
+            text,
+            ts,
+            messageId: previewMsg ? normalizeTimelineMessageId(previewMsg) : null,
+            direction,
+            msgType: type
+        });
+    }
+
+    /**
+     * Sync thread preview from active messages.
+     */
+    syncThreadFromActiveMessages() {
+        const state = this.deps.getMessageState();
+        if (!state.conversationId || !state.activePeerDigest) return;
+        const timeline = state.messages || [];
+        if (!timeline.length) return;
+
+        const lastMsg = timeline[timeline.length - 1];
+        const msgType = lastMsg.msgType || lastMsg.subtype || 'text';
+        const text = msgType === 'conversation-deleted'
+            ? t('messages.noMessages')
+            : resolveMessagePreview(lastMsg);
+        const ts = lastMsg.ts || Date.now();
+
+        this.upsertThread({
+            peerAccountDigest: state.activePeerDigest,
+            peerDeviceId: state.activePeerDeviceId,
+            conversationId: state.conversationId,
+            tokenB64: state.conversationToken,
+            lastMsgType: msgType
+        });
+
+        const threads = this.getThreads();
+        const thread = threads.get(state.conversationId);
+        if (thread) {
+            updateThreadPreview(thread, {
+                text,
+                ts,
+                messageId: lastMsg.id || lastMsg.messageId || null,
+                direction: lastMsg.direction,
+                msgType
+            }, { force: true });
+        }
+    }
+
+    /**
+     * Refresh unread badges on contacts.
+     */
+    refreshUnreadBadges() {
+        const contactState = this.deps.sessionStore.contactState;
+        if (!Array.isArray(contactState) || !contactState.length) return;
+
+        const threads = this.getThreads();
+        for (const contact of contactState) {
+            const key = this._contactPeerKey(contact);
+            if (!key) continue;
+            const thread = threads.get(contact?.conversation?.conversation_id || '') || null;
+            const unread = thread?.unreadCount || 0;
+
+            const contactEntry = this.deps.sessionStore.contactIndex?.get?.(key);
+            if (contactEntry) {
+                if (typeof contactEntry.unreadCount !== 'number') contactEntry.unreadCount = 0;
+                contactEntry.unreadCount = unread;
+            }
+        }
+    }
+
+    /**
+     * Get thread peer key.
+     */
+    /**
+     * Get thread peer key.
+     */
+    _threadPeer(thread) {
+        if (!thread) return null;
+        if (thread.peerKey) return thread.peerKey;
+        if (thread.peerAccountDigest && thread.peerDeviceId) {
+            return `${thread.peerAccountDigest}::${thread.peerDeviceId}`;
+        }
+        return normalizePeerKey(thread.peerAccountDigest ?? thread);
+    }
+
+    /**
+     * Get contact peer key.
+     */
+    _contactPeerKey(contact) {
+        if (!contact) return null;
+        return normalizePeerKey(contact.peerAccountDigest || contact.accountDigest || null);
+    }
+
+    /**
+     * Get initials from name.
+     */
+    getInitials(name, fallback) {
+        return this._initialsFromName(name, fallback);
+    }
+
+    /**
+     * Generate initials from name (internal).
+     */
+    _initialsFromName(name, fallback) {
+        if (!name) return (fallback || '?').slice(-2).toUpperCase();
+        const parts = name.trim().split(/\s+/);
+        if (parts.length >= 2) {
+            return (parts[0][0] + parts[1][0]).toUpperCase();
+        }
+        return name.slice(0, 2).toUpperCase();
+    }
+
+    /**
+     * Format timestamp for conversation preview.
+     */
+    _formatConversationPreviewTime(ts) {
+        if (!Number.isFinite(ts)) return '';
+        // Defensive auto-conversion: if ts looks like seconds (< 10^10),
+        // upscale to ms so we don't fall back to rendering 1970 dates when
+        // a caller accidentally stores a seconds-based timestamp.
+        const tsMs = ts > 10_000_000_000 ? ts : ts * 1000;
+        const date = new Date(tsMs);
+        const now = new Date();
+        const isToday = date.toDateString() === now.toDateString();
+        if (isToday) {
+            return date.toLocaleTimeString('zh-TW', { hour: '2-digit', minute: '2-digit' });
+        }
+        const yesterday = new Date(now);
+        yesterday.setDate(yesterday.getDate() - 1);
+        if (date.toDateString() === yesterday.toDateString()) {
+            return t('common.yesterday');
+        }
+        return date.toLocaleDateString('zh-TW', { month: 'short', day: 'numeric' });
+    }
+
+    /**
+     * Apply pull transition animation.
+     */
+    applyConversationPullTransition(enable) {
+        if (this.elements.conversationRefreshEl) {
+            this.elements.conversationRefreshEl.style.transition = enable ? 'transform 120ms ease-out, opacity 120ms ease-out' : 'none';
+        }
+        const toggleEl = document.getElementById('quickActionsToggle');
+        if (toggleEl) {
+            toggleEl.style.transition = enable ? 'transform 120ms ease-out' : '';
+        }
+        if (this.elements.conversationQuickActions) {
+            this.elements.conversationQuickActions.style.transition = enable ? 'transform 120ms ease-out' : '';
+        }
+        if (this.elements.conversationList) {
+            this.elements.conversationList.style.transition = enable ? 'transform 120ms ease-out' : '';
+        }
+    }
+
+    /**
+     * Update pull-to-refresh visual state.
+     */
+    updateConversationPull(offset) {
+        const clamped = Math.min(CONV_PULL_MAX, Math.max(0, offset));
+        const progress = Math.min(1, clamped / CONV_PULL_THRESHOLD);
+        if (this.elements.conversationRefreshEl) {
+            const fadeStart = 5;
+            const fadeRange = 25;
+            const alpha = Math.min(1, Math.max(0, (clamped - fadeStart) / fadeRange));
+            this.elements.conversationRefreshEl.style.opacity = String(alpha);
+            // Centre the indicator in the gap opened by the pull
+            const indicatorH = this.elements.conversationRefreshEl.offsetHeight || 36;
+            const centerY = Math.max(0, (clamped - indicatorH) / 2);
+            this.elements.conversationRefreshEl.style.transform = `translateY(${centerY}px)`;
+            const spinner = this.elements.conversationRefreshEl.querySelector('.icon');
+            const labelEl = this.elements.conversationRefreshLabelEl || this.elements.conversationRefreshEl.querySelector('.label');
+            if (spinner && labelEl) {
+                if (this.conversationsRefreshing) {
+                    spinner.classList.add('spin');
+                    labelEl.textContent = t('common.refreshing');
+                } else {
+                    spinner.classList.remove('spin');
+                    labelEl.textContent = clamped >= CONV_PULL_THRESHOLD ? t('messages.releaseToRefreshConversations') : t('messages.pullToRefreshConversations');
+                }
+            }
+        }
+        const toggleEl = document.getElementById('quickActionsToggle');
+        if (toggleEl) {
+            toggleEl.style.transform = clamped > 0 ? `translateY(${clamped}px)` : '';
+        }
+        if (this.elements.conversationQuickActions) {
+            this.elements.conversationQuickActions.style.transform = clamped > 0 ? `translateY(${clamped}px)` : '';
+        }
+        if (this.elements.conversationList) {
+            this.elements.conversationList.style.transform = clamped > 0 ? `translateY(${clamped}px)` : '';
+        }
+    }
+
+    /**
+     * Reset pull-to-refresh state.
+     */
+    resetConversationPull({ animate = true } = {}) {
+        this.conversationPullDistance = 0;
+        this.applyConversationPullTransition(animate);
+        this.updateConversationPull(0);
+    }
+
+    /**
+     * Handle pull-to-refresh trigger.
+     */
+    async handleConversationRefresh() {
+        if (this.conversationsRefreshing) return;
+        this.conversationsRefreshing = true;
+        this.updateConversationPull(CONV_PULL_THRESHOLD);
+        try {
+            this.deps.reconcileUnconfirmedInvites?.()
+                .then(result => {
+                    if (result && (result.replayed > 0 || result.alreadyReady > 0)) {
+                        this.deps.syncConversationThreadsFromContacts?.();
+                        this.renderConversationList();
+                    }
+                })
+                .catch(err => this.log?.({ reconcileOnRefreshError: err?.message }));
+
+            this.deps.reconcileUnconfirmedDeliveries?.()
+                .then(result => {
+                    if (result && (result.replayed > 0 || result.alreadyReady > 0)) {
+                        this.deps.syncConversationThreadsFromContacts?.();
+                        this.renderConversationList();
+                    }
+                })
+                .catch(err => this.log?.({ reconcileDeliveriesOnRefreshError: err?.message }));
+
+            this.deps.syncConversationThreadsFromContacts?.();
+            await this.deps.refreshConversationPreviews?.({ force: true });
+            this.renderConversationList();
+        } catch (err) {
+            this.log({ conversationPullRefreshError: err?.message || err });
+        } finally {
+            this.conversationsRefreshing = false;
+            this.resetConversationPull({ animate: true });
+        }
+    }
+
+    /**
+     * Handle touch start for pull-to-refresh.
+     */
+    handleConversationPullStart(e) {
+        if (!this.elements.conversationList) return;
+        if (this.elements.conversationList.scrollTop > 0) {
+            this.conversationPullInvalid = true;
+            return;
+        }
+        this.conversationPullInvalid = false;
+        if (e.touches?.length !== 1) return;
+        this.conversationPullTracking = true;
+        this.conversationPullDecided = false;
+        this.conversationPullStartY = e.touches[0].clientY;
+        this.conversationPullStartX = e.touches[0].clientX;
+        this.conversationPullDistance = 0;
+        this.applyConversationPullTransition(false);
+    }
+
+    /**
+     * Handle touch move for pull-to-refresh.
+     */
+    handleConversationPullMove(e) {
+        if (!this.conversationPullTracking || this.conversationPullInvalid || this.conversationsRefreshing) return;
+        if (e.touches?.length !== 1) return;
+        const dy = e.touches[0].clientY - this.conversationPullStartY;
+        const dx = Math.abs(e.touches[0].clientX - this.conversationPullStartX);
+        if (!this.conversationPullDecided) {
+            if (Math.abs(dy) < 8 && dx < 8) return;
+            this.conversationPullDecided = true;
+            if (dy <= 0 || dy < Math.abs(dx)) {
+                this.conversationPullTracking = false;
+                this.conversationPullInvalid = true;
+                this.resetConversationPull({ animate: true });
+                return;
+            }
+        }
+        this.conversationPullDistance = dy;
+        if (this.conversationPullDistance > 0) {
+            e.preventDefault();
+            this.updateConversationPull(this.conversationPullDistance);
+        }
+    }
+
+    /**
+     * Handle touch end for pull-to-refresh.
+     */
+    handleConversationPullEnd() {
+        const wasTracking = this.conversationPullTracking;
+        this.conversationPullTracking = false;
+        // Always reset visual if any pull offset was applied, regardless of tracking state
+        if (!wasTracking || this.conversationsRefreshing || this.conversationPullInvalid) {
+            if (this.conversationPullDistance > 0 || this.conversationsRefreshing) {
+                this.resetConversationPull({ animate: true });
+            }
+            return;
+        }
+        if (this.conversationPullDistance >= CONV_PULL_THRESHOLD) {
+            this.handleConversationRefresh();
+        } else {
+            this.resetConversationPull({ animate: true });
+        }
+    }
+
+    /**
+     * Render the conversation list.
+     */
+    renderConversationList() {
+        if (!this.elements.conversationList) return;
+        const openPeer = this.elements.conversationList.querySelector('.conversation-item.show-delete')?.dataset?.peer || null;
+        const contacts = Array.isArray(this.sessionStore.contactState) ? [...this.sessionStore.contactState] : [];
+        let state = this.getMessageState();
+
+        // Handle active peer removed from contacts (skip for ephemeral conversations)
+        const isEphemeralActive = state.activePeerDigest && this.deps.controllers?.ephemeral?.isEphemeralConversation?.(state.conversationId);
+        if (state.activePeerDigest && !isEphemeralActive) {
+            const exists = contacts.some((c) => this._contactPeerKey(c) === state.activePeerDigest);
+            if (!exists) {
+                const { digest: activeDigest, deviceId: activeDeviceId } = splitPeerKey(state.activePeerDigest || null);
+                const resolvedActiveDeviceId = activeDeviceId || state.activePeerDeviceId || null;
+                const resolvedCore = resolveReadyContactCoreEntry(state.activePeerDigest, resolvedActiveDeviceId, state.conversationId);
+                const activeCoreEntry = resolvedCore.entry;
+                const hasCore = !!activeCoreEntry;
+                const isCoreReady = !!activeCoreEntry?.isReady;
+                const coreHasConversation = !!activeCoreEntry?.conversationId && !!activeCoreEntry?.conversationToken;
+                const coreVaultReady = isCoreVaultReady(resolvedCore.peerKey || state.activePeerDigest, resolvedActiveDeviceId, state.conversationId);
+                const shouldKeepActivePeer = (hasCore && isCoreReady && coreHasConversation) || coreVaultReady;
+                const hasActiveConversation = !!(state.conversationId && state.conversationToken);
+                const isViewingMessages = this.deps.isDesktopLayout?.() || state.viewMode === 'detail';
+                const activationInFlight = state.loading || this.deps.pendingSecureReadyPeer === state.activePeerDigest;
+
+                if (!shouldKeepActivePeer && (!hasActiveConversation || (!isViewingMessages && !activationInFlight))) {
+                    this.deps.resetMessageStateWithPlaceholders?.();
+                    state = this.getMessageState();
+                    if (!this.deps.isDesktopLayout?.()) state.viewMode = 'list';
+                    if (this.elements.peerName) this.elements.peerName.textContent = t('contacts.selectToChat');
+                    this.deps.setMessagesStatus?.('');
+                    this.deps.clearMessagesView?.();
+                    this.deps.updateComposerAvailability?.();
+                    this.deps.applyMessagesLayout?.();
+                }
+            }
+        }
+
+        // Use local sync method which has robust Digest/Key handling
+        this.syncFromContacts();
+        this.deps.refreshContactsUnreadBadges?.();
+        this.elements.conversationList.innerHTML = '';
+
+        const threads = this.deps.getConversationThreads?.() || new Map();
+        const threadEntries = Array.from(threads.values())
+            .filter((thread) => thread?.conversationId && (thread.type === 'biz-conv' || this._threadPeer(thread)))
+            .sort((a, b) => (b.lastMessageTs || 0) - (a.lastMessageTs || 0));
+
+        const totalUnread = threadEntries.reduce((sum, thread) => sum + Number(thread.unreadCount || 0) + Number(thread.offlineUnreadCount || 0), 0);
+        this.deps.updateNavBadge?.('messages', totalUnread > 0 ? totalUnread : null);
+
+        console.log('[ConvList] render', {
+            threadsSize: threads.size,
+            entriesCount: threadEntries.length,
+            html: this.elements.conversationList ? 'exists' : 'missing'
+        });
+
+        if (!threadEntries.length) {
+            const li = document.createElement('li');
+            li.className = 'conversation-item disabled';
+            li.innerHTML = `<div class="conversation-empty">${t('messages.noMessages')}</div>`;
+            this.elements.conversationList.appendChild(li);
+            // Don't return — ephemeral items still need to render below
+        }
+
+        for (const thread of threadEntries) {
+            // ── Biz-conv (business conversation / group) thread ──
+            if (thread.type === 'biz-conv') {
+                const li = document.createElement('li');
+                li.className = 'conversation-item biz-conv-item';
+                li.style.touchAction = 'pan-y';
+                li.dataset.conversationId = thread.conversationId;
+                li.dataset.bizConv = '1';
+
+                const isActive = state.conversationId === thread.conversationId && state.activeBizConv;
+                if (isActive) li.classList.add('active');
+
+                const groupName = thread.bizConvName || t('messages.bizConvDefault');
+                const memberCount = thread.bizConvMemberCount || 0;
+                const initials = groupName.slice(0, 2).toUpperCase();
+                const timeLabel = this._formatConversationPreviewTime(thread.lastMessageTs);
+                const snippet = thread.lastMessageText || '';
+                const unread = Number.isFinite(thread.unreadCount) ? thread.unreadCount : 0;
+                const avatarHtml = thread.bizConvAvatar
+                    ? `<img class="conversation-avatar biz-conv-avatar-img" src="${escapeHtml(thread.bizConvAvatar)}" alt="" />`
+                    : `<div class="conversation-avatar biz-conv-avatar"><span>${escapeHtml(initials)}</span></div>`;
+
+                li.innerHTML = `
+        <div class="item-content conversation-item-content">
+          ${avatarHtml}
+          <div class="conversation-content">
+            <div class="conversation-row conversation-row-top">
+              <span class="conversation-name"><svg class="icon" style="margin-right:4px;vertical-align:middle"><use href="#i-users"/></svg>${escapeHtml(groupName)}</span>
+              <span class="conversation-time">${escapeHtml(timeLabel)}</span>
+            </div>
+            <div class="conversation-row conversation-row-bottom">
+              <span class="conversation-snippet">${escapeHtml(snippet || t('messages.noMessages'))}</span>
+              ${unread > 0 ? `<span class="conversation-badge conversation-badge-small">${escapeHtml(unread > 99 ? '99+' : String(unread))}</span>` : ''}
+            </div>
+          </div>
+        </div>
+      `;
+                // No swipe-to-delete for biz-conv — members can only "leave"
+
+                li.addEventListener('click', (e) => {
+                    if (this._scrolledDuringTouch) return;
+                    if (this.elements.conversationList && Math.abs(this.elements.conversationList.scrollTop - this._touchStartScroll) > 2) return;
+                    this.deps.setActiveBizConv?.(thread.conversationId);
+                });
+                li.addEventListener('keydown', (e) => {
+                    if (e.key === 'Enter' || e.key === ' ') {
+                        e.preventDefault();
+                        this.deps.setActiveBizConv?.(thread.conversationId);
+                    }
+                });
+
+                this.elements.conversationList.appendChild(li);
+                continue;
+            }
+
+            // ── Standard 1-to-1 thread ──
+            const peerDigest = this._threadPeer(thread);
+            if (!peerDigest) continue;
+
+            const li = document.createElement('li');
+            li.className = 'conversation-item';
+            li.style.touchAction = 'pan-y'; // Force browser to handle vertical only, JS horizontal
+            li.dataset.peer = peerDigest;
+            li.dataset.conversationId = thread.conversationId;
+            if (thread.peerDeviceId) li.dataset.peerDeviceId = thread.peerDeviceId;
+
+            const isActivePeer = state.activePeerDigest === peerDigest;
+            const isActiveDevice = !state.activePeerDeviceId || !thread.peerDeviceId || state.activePeerDeviceId === thread.peerDeviceId;
+            if (isActivePeer && isActiveDevice) li.classList.add('active');
+            if (openPeer && openPeer === peerDigest) li.classList.add('show-delete');
+
+            const nickname = thread.nickname || `${t('contacts.friendPrefix')}${peerDigest.slice(-4)}`;
+            const initials = this._initialsFromName(nickname, peerDigest);
+            const avatarSrc = thread.avatar?.thumbDataUrl || thread.avatar?.previewDataUrl || thread.avatar?.url || null;
+            const timeLabel = this._formatConversationPreviewTime(thread.lastMessageTs);
+            const snippet = formatThreadPreview(thread);
+            const offlineUnread = Number.isFinite(thread.offlineUnreadCount) ? thread.offlineUnreadCount : 0;
+            const unread = (Number.isFinite(thread.unreadCount) ? thread.unreadCount : 0) + offlineUnread;
+
+            li.innerHTML = `
+        <div class="item-content conversation-item-content">
+          <div class="conversation-avatar">${avatarSrc ? `<img src="${escapeHtml(avatarSrc)}" alt="${escapeHtml(nickname)}" />` : `<span>${escapeHtml(initials)}</span>`}</div>
+          <div class="conversation-content">
+            <div class="conversation-row conversation-row-top">
+              <span class="conversation-name">${escapeHtml(nickname)}</span>
+              <span class="conversation-time">${escapeHtml(timeLabel)}</span>
+            </div>
+            <div class="conversation-row conversation-row-bottom">
+              <span class="conversation-snippet">${escapeHtml(snippet || t('messages.noMessages'))}</span>
+              ${unread > 0 ? `<span class="conversation-badge conversation-badge-small ${offlineUnread > 0 ? 'badge-offline-gap' : ''}">${escapeHtml(unread > 99 ? '99+' : String(unread))}</span>` : ''}
+            </div>
+          </div>
+        </div>
+        <button type="button" class="item-delete" aria-label="${t('messages.deleteConversationAriaLabel')}"><svg class="icon"><use href="#i-trash-2"/></svg></button>
+      `;
+
+            // Emoji identifier badge
+            const convAvatarEl = li.querySelector('.conversation-avatar');
+            if (convAvatarEl) applyAvatarBadge(convAvatarEl, splitPeerKey(peerDigest).digest || peerDigest);
+
+            const deleteBtn = li.querySelector('.item-delete');
+            deleteBtn?.addEventListener('click', (e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                this.deps.handleConversationDelete?.({ conversationId: thread.conversationId, peerAccountDigest: peerDigest, element: li });
+            });
+
+            li.addEventListener('click', (e) => {
+                // Suppress accidental selection when user was scrolling
+                if (this._scrolledDuringTouch) return;
+                // Fallback: check if container scrolled since touchstart
+                if (this.elements.conversationList && Math.abs(this.elements.conversationList.scrollTop - this._touchStartScroll) > 2) return;
+                if (li.classList.contains('show-delete')) {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    this.deps.closeSwipe?.(li);
+                    return;
+                }
+                if (e.target.closest('.item-delete')) return;
+                if (li.classList.contains('show-delete')) { this.deps.closeSwipe?.(li); return; }
+                const threadKey = this._threadPeer(thread) || peerDigest;
+                // [FIX] Pass conversationId and token to support direct opening without index lookup
+                this.deps.setActiveConversation?.(threadKey, thread.conversationId, thread.conversationToken);
+            });
+
+            li.addEventListener('keydown', (e) => {
+                const threadKey = this._threadPeer(thread) || peerDigest;
+                if (e.key === 'Enter' || e.key === ' ') {
+                    e.preventDefault();
+                    // [FIX] Pass conversationId and token
+                    this.deps.setActiveConversation?.(threadKey, thread.conversationId, thread.conversationToken);
+                }
+                if (e.key === 'Delete') {
+                    e.preventDefault();
+                    this.deps.handleConversationDelete?.({ conversationId: thread.conversationId, peerAccountDigest: peerDigest, element: li });
+                }
+            });
+
+            this.deps.setupSwipe?.(li);
+            this.elements.conversationList.appendChild(li);
+        }
+
+        // Render ephemeral sessions pinned at top
+        this.deps.controllers?.ephemeral?.renderEphemeralItems?.(this.elements.conversationList);
+    }
+
+    /**
+     * Initialize touch event listeners for pull-to-refresh.
+     */
+    init() {
+        super.init();
+        if (this.elements.conversationList) {
+            this.elements.conversationList.addEventListener('touchstart', (e) => this.handleConversationPullStart(e), { passive: true });
+            this.elements.conversationList.addEventListener('touchmove', (e) => this.handleConversationPullMove(e), { passive: false });
+            this.elements.conversationList.addEventListener('touchend', () => this.handleConversationPullEnd());
+            this.elements.conversationList.addEventListener('touchcancel', () => this.handleConversationPullEnd());
+
+            // Scroll-vs-tap: robust detection using scroll event + finger movement
+            this._touchActive = false;
+            this.elements.conversationList.addEventListener('touchstart', (e) => {
+                if (e.touches.length === 1) {
+                    this._touchActive = true;
+                    this._touchStartY = e.touches[0].clientY;
+                    this._touchStartX = e.touches[0].clientX;
+                    this._touchStartScroll = this.elements.conversationList.scrollTop;
+                    this._scrolledDuringTouch = false;
+                }
+            }, { passive: true });
+            this.elements.conversationList.addEventListener('touchend', () => {
+                // Keep _touchActive true briefly so the scroll event that fires
+                // after touchend (iOS momentum) still suppresses the click
+                setTimeout(() => { this._touchActive = false; }, 400);
+            }, { passive: true });
+            // The scroll event fires reliably on iOS even during momentum scroll
+            this.elements.conversationList.addEventListener('scroll', () => {
+                if (this._touchActive) this._scrolledDuringTouch = true;
+            }, { passive: true });
+            this.elements.conversationList.addEventListener('touchmove', (e) => {
+                if (!this._scrolledDuringTouch && e.touches.length === 1) {
+                    const dy = Math.abs(e.touches[0].clientY - this._touchStartY);
+                    const dx = Math.abs(e.touches[0].clientX - this._touchStartX);
+                    if (dy > 6 || dx > 6) {
+                        this._scrolledDuringTouch = true;
+                    }
+                }
+            }, { passive: true });
+        }
+
+        // Quick-actions toggle (chevron tap or pull-down)
+        this._quickActionsExpanded = false;
+        const toggleEl = document.getElementById('quickActionsToggle');
+        const qaEl = this.elements.conversationQuickActions || document.getElementById('conversationQuickActions');
+        if (toggleEl && qaEl) {
+            const expand = () => {
+                this._quickActionsExpanded = true;
+                qaEl.classList.remove('collapsed');
+                toggleEl.classList.add('expanded');
+            };
+            const collapse = () => {
+                this._quickActionsExpanded = false;
+                qaEl.classList.add('collapsed');
+                toggleEl.classList.remove('expanded');
+            };
+            // Tap chevron to toggle
+            toggleEl.addEventListener('click', () => {
+                if (this._quickActionsExpanded) collapse(); else expand();
+            });
+            // Auto-collapse after a button inside is clicked
+            qaEl.addEventListener('click', (e) => {
+                if (e.target.closest('.quick-action-btn')) {
+                    setTimeout(() => collapse(), 300);
+                }
+            });
+        }
+    }
+}

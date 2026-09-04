@@ -1,0 +1,1194 @@
+<!doctype html>
+<html lang="zh-Hant">
+
+<head>
+  <meta charset="utf-8" />
+  <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
+  <meta http-equiv="Pragma" content="no-cache" />
+  <meta http-equiv="Expires" content="0" />
+  <meta name="viewport"
+    content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover" />
+  <meta name="color-scheme" content="dark" />
+  <meta name="theme-color" content="#0f172a" media="(prefers-color-scheme: dark)" />
+  <meta name="theme-color" content="#0f172a" media="(prefers-color-scheme: light)" />
+  <title>SENTRY MESSENGER — App</title>
+  <link rel="icon" href="/assets/favicon.ico" type="image/x-icon" />
+  <link rel="manifest" href="/manifest.json" />
+  <script>
+    // PWA standalone detection: redirect to push management page
+    // (PWA cannot login — requires NTAG424 physical chip)
+    try {
+      var isPWA = window.matchMedia('(display-mode: standalone)').matches || window.navigator.standalone === true;
+      if (isPWA) { location.replace('/pages/pwa-push.html'); }
+    } catch (e) {}
+  </script>
+  <!-- Loading Modal inline styles — renders before any external CSS -->
+  <style>
+    #appLoadingModal{position:fixed;inset:0;z-index:99999;display:flex;flex-direction:column;align-items:center;justify-content:center;background:#050a14;font-family:'SF Mono',SFMono-Regular,Consolas,'Liberation Mono',Menlo,monospace;overflow:hidden}
+    #appLoadingModal .app-tm-canvas{position:absolute;inset:0;z-index:0}
+    #appLoadingModal .app-tm-overlay{position:absolute;inset:0;z-index:1;background:radial-gradient(ellipse at 50% 50%,transparent 0%,rgba(5,10,20,0.4) 60%,rgba(5,10,20,0.85) 100%);pointer-events:none}
+    #appLoadingModal .app-tm-content{position:relative;z-index:2;display:flex;flex-direction:column;align-items:center;gap:0;pointer-events:none}
+    #appLoadingModal.glitch-out{pointer-events:none;animation:glitch-dissolve .7s ease-out forwards}
+    @keyframes glitch-dissolve{0%{transform:translate(0);filter:none;opacity:1}15%{transform:translate(-5px,2px) skewX(-2deg);filter:hue-rotate(90deg) saturate(3) brightness(1.4);opacity:1}30%{transform:translate(6px,-3px) skewX(3deg);filter:hue-rotate(-60deg) brightness(1.8);opacity:.9}50%{transform:translate(-3px,4px) scaleX(1.03);filter:blur(2px) hue-rotate(120deg) saturate(2);opacity:.65}70%{transform:translate(4px,-2px) scaleY(1.04);filter:blur(6px) brightness(1.2);opacity:.3}100%{transform:translate(0) scale(1.06);filter:blur(16px);opacity:0}}
+    #appLoadingModal .loading-logo{width:52px;height:52px;margin-bottom:18px;filter:brightness(0) invert(1) drop-shadow(0 0 18px rgba(56,189,248,0.45)) drop-shadow(0 0 40px rgba(99,102,241,0.25));animation:app-pulse 3s ease-in-out infinite}
+    #appLoadingModal .loading-brand{font-size:18px;font-weight:700;letter-spacing:4px;color:#e0f2fe;margin-bottom:8px;text-shadow:0 0 20px rgba(56,189,248,0.5),0 0 40px rgba(99,102,241,0.3);min-width:220px;text-align:center;height:1.4em;line-height:1.4em}
+    #appLoadingModal .loading-sublabel{font-size:11px;letter-spacing:2.5px;color:rgba(148,163,184,0.65);text-transform:uppercase;margin-bottom:32px}
+    #appLoadingModal .loading-bar-track{width:200px;height:2px;border-radius:1px;background:rgba(148,163,184,0.15);overflow:hidden;margin-bottom:16px;position:relative}
+    #appLoadingModal .loading-bar-fill{width:70%;height:100%;border-radius:1px;background:linear-gradient(90deg,#0ea5e9,#6366f1,#a855f7);box-shadow:0 0 12px rgba(99,102,241,0.6);transition:width .3s ease}
+    #appLoadingModal .loading-bar-scan{position:absolute;top:0;height:100%;width:40px;background:linear-gradient(90deg,transparent,rgba(56,189,248,0.6),transparent);animation:app-scan 2s linear infinite}
+    #appLoadingModal .loading-label{font-size:12px;color:rgba(148,163,184,0.7);letter-spacing:1px}
+    @keyframes app-pulse{0%,100%{filter:brightness(0) invert(1) drop-shadow(0 0 18px rgba(56,189,248,0.45)) drop-shadow(0 0 40px rgba(99,102,241,0.25))}50%{filter:brightness(0) invert(1) drop-shadow(0 0 28px rgba(56,189,248,0.7)) drop-shadow(0 0 60px rgba(99,102,241,0.4))}}
+    @keyframes app-pulse-mono{0%,100%{filter:drop-shadow(0 0 18px rgba(56,189,248,0.45)) drop-shadow(0 0 40px rgba(99,102,241,0.25))}50%{filter:drop-shadow(0 0 28px rgba(56,189,248,0.7)) drop-shadow(0 0 60px rgba(99,102,241,0.4))}}
+    #appLoadingModal .loading-logo.mono-done{filter:drop-shadow(0 0 18px rgba(56,189,248,0.45)) drop-shadow(0 0 40px rgba(99,102,241,0.25));animation-name:app-pulse-mono}
+    #appLoadingModal .loading-logo.color-logo{filter:drop-shadow(0 0 18px rgba(56,189,248,0.45)) drop-shadow(0 0 40px rgba(99,102,241,0.25));animation-name:app-pulse-mono}
+    @keyframes app-scan{0%{left:-40px}100%{left:calc(100% + 40px)}}
+    /* ── Morph: progress bar → enter button ── */
+    #appLoadingModal .loading-bar-track{transition:width .6s cubic-bezier(.4,0,.2,1),height .6s cubic-bezier(.4,0,.2,1),border-radius .6s ease,box-shadow .6s ease,transform .15s ease}
+    #appLoadingModal .loading-enter-label{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font-size:15px;font-weight:700;letter-spacing:3px;color:#fff;opacity:0;transition:opacity .4s ease .3s;pointer-events:none;z-index:2;text-shadow:0 0 10px rgba(255,255,255,0.3)}
+    #appLoadingModal .loading-status{font-size:12px;min-height:0;height:0;color:#f97316;opacity:0;transition:opacity .3s ease,min-height .4s ease,height .4s ease,margin .4s ease,padding .4s ease;margin:0;overflow:hidden}
+    #appLoadingModal .loading-skip{font-size:12px;color:rgba(148,163,184,0.45);cursor:pointer;opacity:0;transition:opacity .4s ease .6s,height .4s ease,padding .4s ease,margin .4s ease;pointer-events:none;border:none;background:none;font-family:inherit;letter-spacing:1px;height:0;padding:0;margin:0;overflow:hidden}
+    #appLoadingModal .loading-skip:active{opacity:.7}
+    #appLoadingModal.morph-enter .app-tm-content{pointer-events:auto}
+    #appLoadingModal.morph-enter .loading-bar-track{width:220px;height:48px;border-radius:24px;cursor:pointer;animation:app-btn-glow 2s ease-in-out infinite}
+    #appLoadingModal.morph-enter .loading-bar-fill{width:100%!important;border-radius:24px;transition:width .3s ease,border-radius .6s ease,background .4s ease}
+    #appLoadingModal.morph-enter .loading-bar-scan{height:100%;border-radius:24px}
+    #appLoadingModal.morph-enter .loading-enter-label{opacity:1;pointer-events:auto}
+    #appLoadingModal.morph-enter .loading-sublabel{opacity:0;transition:opacity .3s ease}
+    #appLoadingModal.morph-enter .loading-status{opacity:1;min-height:16px;height:auto;margin-top:-8px;overflow:visible}
+    #appLoadingModal.morph-enter .loading-skip{opacity:1;pointer-events:auto;height:auto;padding:4px 8px;overflow:visible}
+    #appLoadingModal.morph-enter .loading-bar-track:active{transform:scale(0.97)}
+    @keyframes app-btn-glow{0%,100%{box-shadow:0 0 20px rgba(56,189,248,0.4),0 0 60px rgba(99,102,241,0.2)}50%{box-shadow:0 0 30px rgba(56,189,248,0.6),0 0 80px rgba(99,102,241,0.35)}}
+    #appLoadingModal.morph-authorizing .loading-bar-track{pointer-events:none;cursor:default;animation:none;box-shadow:0 0 15px rgba(56,189,248,0.3)}
+    #appLoadingModal.morph-authorizing .loading-enter-label{letter-spacing:2px}
+    #appLoadingModal.morph-success .loading-bar-fill{background:linear-gradient(90deg,#22c55e,#15803d)!important}
+    #appLoadingModal.morph-success .loading-bar-track{animation:none;box-shadow:0 0 25px rgba(34,197,94,0.5),0 0 60px rgba(34,197,94,0.2)}
+    /* ── UAT Environment Badge ── */
+    .uat-badge{position:fixed;top:12px;left:50%;transform:translateX(-50%);z-index:100000;display:none;padding:4px 18px;border-radius:6px;font-size:13px;font-weight:800;letter-spacing:3px;color:#000;background:linear-gradient(90deg,#facc15,#fb923c);box-shadow:0 0 16px rgba(250,204,21,0.5),0 2px 8px rgba(0,0,0,0.4);animation:uat-pulse 2s ease-in-out infinite;pointer-events:none;user-select:none;font-family:system-ui,sans-serif}
+    .uat-badge.visible{display:block}
+    @keyframes uat-pulse{0%,100%{box-shadow:0 0 16px rgba(250,204,21,0.5),0 2px 8px rgba(0,0,0,0.4)}50%{box-shadow:0 0 28px rgba(250,204,21,0.8),0 2px 12px rgba(0,0,0,0.5)}}
+  </style>
+  <!-- Async CSS — non-render-blocking -->
+  <link rel="stylesheet" href="/assets/app-bundle.css" media="print" onload="this.media='all'" />
+  <noscript><link rel="stylesheet" href="/assets/app-bundle.css" /></noscript>
+  <link rel="stylesheet" href="/assets/icons/lucide.css" media="print" onload="this.media='all'" />
+  <noscript><link rel="stylesheet" href="/assets/icons/lucide.css" /></noscript>
+  <script>
+    // 防止未初始化時的全域 ReferenceError（Safari 會因 inviteBtn 未宣告而中斷）
+    if (typeof inviteBtn === 'undefined') {
+      // eslint-disable-next-line no-var
+      var inviteBtn = null;
+    }
+  </script>
+  <script>
+    window.APP_VERSION = '0.1.21-atomic-fix';
+    window.APP_ENV = 'uat';
+    window.APP_BUILD_AT = (function () { try { return new Date(document.lastModified).toISOString(); } catch { return new Date().toISOString(); } })();
+  </script>
+  <script>
+    // Inline i18n bootstrap — loads locale JSON synchronously so splash text is translated on first paint.
+    // Uses browser language ONLY (no localStorage) to prevent nationality metadata leakage before login.
+    // After login, encrypted settings will override language via setLang().
+    (function(){
+      var lang = 'en';
+      try { lang = navigator.language || 'en'; } catch {}
+      var tag = lang.toLowerCase();
+      if (tag==='zh-hant'||tag==='zh-tw'||tag==='zh-hk'||tag.indexOf('zh-hant')===0) tag='zh-Hant';
+      else if (tag==='zh-hans'||tag==='zh-cn'||tag==='zh-sg'||tag.indexOf('zh-hans')===0||tag==='zh') tag='zh-Hans';
+      else tag = tag.split('-')[0];
+      var supported = {en:1,'zh-Hant':1,'zh-Hans':1,ja:1,ko:1,th:1,vi:1};
+      if (!supported[tag]) tag = 'en';
+      var msgs = {}, fb = {};
+      function loadSync(url) {
+        try { var x = new XMLHttpRequest(); x.open('GET', url, false); x.send(); return x.status===200 ? JSON.parse(x.responseText) : {}; } catch { return {}; }
+      }
+      fb = loadSync('/locales/en.json');
+      if (tag !== 'en') msgs = loadSync('/locales/' + tag + '.json');
+      function resolve(o, p) { return p.split('.').reduce(function(a,k){ return a&&a[k]; }, o); }
+      window.__t = function(key, params) {
+        var val = resolve(msgs, key) || resolve(fb, key) || key;
+        if (!params || typeof val !== 'string') return val;
+        return val.replace(/\{(\w+)\}/g, function(_, k) { return params[k] != null ? params[k] : '{'+k+'}'; });
+      };
+      window.__i18nApply = function() {
+        document.querySelectorAll('[data-i18n]').forEach(function(el) {
+          var k = el.getAttribute('data-i18n'); if (k) el.textContent = window.__t(k);
+        });
+        document.querySelectorAll('[data-i18n-placeholder]').forEach(function(el) {
+          var k = el.getAttribute('data-i18n-placeholder'); if (k) el.placeholder = window.__t(k);
+        });
+        document.querySelectorAll('[data-i18n-aria-label]').forEach(function(el) {
+          var k = el.getAttribute('data-i18n-aria-label'); if (k) el.setAttribute('aria-label', window.__t(k));
+        });
+        document.querySelectorAll('[data-i18n-title]').forEach(function(el) {
+          var k = el.getAttribute('data-i18n-title'); if (k) el.title = window.__t(k);
+        });
+        document.querySelectorAll('[data-i18n-alt]').forEach(function(el) {
+          var k = el.getAttribute('data-i18n-alt'); if (k) el.alt = window.__t(k);
+        });
+      };
+      document.documentElement.lang = tag;
+    })();
+  </script>
+</head>
+
+<body>
+  <!-- Lucide SVG icon sprite (hidden, referenced via <use href="#i-{name}"/>) -->
+  <svg xmlns="http://www.w3.org/2000/svg" style="display:none"><symbol id="i-circle-user" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><circle cx="12" cy="10" r="3"/><path d="M7 20.662V19a2 2 0 0 1 2-2h6a2 2 0 0 1 2 2v1.662"/></symbol><symbol id="i-message-circle" viewBox="0 0 24 24"><path d="M2.992 16.342a2 2 0 0 1 .094 1.167l-1.065 3.29a1 1 0 0 0 1.236 1.168l3.413-.998a2 2 0 0 1 1.099.092 10 10 0 1 0-4.777-4.719"/></symbol><symbol id="i-cloud" viewBox="0 0 24 24"><path d="M17.5 19H9a7 7 0 1 1 6.71-9h1.79a4.5 4.5 0 1 1 0 9Z"/></symbol><symbol id="i-lock" viewBox="0 0 24 24"><rect width="18" height="11" x="3" y="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></symbol><symbol id="i-user" viewBox="0 0 24 24"><path d="M19 21v-2a4 4 0 0 0-4-4H9a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></symbol><symbol id="i-globe" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M12 2a14.5 14.5 0 0 0 0 20 14.5 14.5 0 0 0 0-20"/><path d="M2 12h20"/></symbol><symbol id="i-phone" viewBox="0 0 24 24"><path d="M13.832 16.568a1 1 0 0 0 1.213-.303l.355-.465A2 2 0 0 1 17 15h3a2 2 0 0 1 2 2v3a2 2 0 0 1-2 2A18 18 0 0 1 2 4a2 2 0 0 1 2-2h3a2 2 0 0 1 2 2v3a2 2 0 0 1-.8 1.6l-.468.351a1 1 0 0 0-.292 1.233 14 14 0 0 0 6.392 6.384"/></symbol><symbol id="i-phone-off" viewBox="0 0 24 24"><path d="M10.1 13.9a14 14 0 0 0 3.732 2.668 1 1 0 0 0 1.213-.303l.355-.465A2 2 0 0 1 17 15h3a2 2 0 0 1 2 2v3a2 2 0 0 1-2 2 18 18 0 0 1-12.728-5.272"/><path d="M22 2 2 22"/><path d="M4.76 13.582A18 18 0 0 1 2 4a2 2 0 0 1 2-2h3a2 2 0 0 1 2 2v3a2 2 0 0 1-.8 1.6l-.468.351a1 1 0 0 0-.292 1.233 14 14 0 0 0 .244.473"/></symbol><symbol id="i-video" viewBox="0 0 24 24"><path d="m16 13 5.223 3.482a.5.5 0 0 0 .777-.416V7.87a.5.5 0 0 0-.752-.432L16 10.5"/><rect x="2" y="6" width="14" height="12" rx="2"/></symbol><symbol id="i-mic-off" viewBox="0 0 24 24"><path d="M12 19v3"/><path d="M15 9.34V5a3 3 0 0 0-5.68-1.33"/><path d="M16.95 16.95A7 7 0 0 1 5 12v-2"/><path d="M18.89 13.23A7 7 0 0 0 19 12v-2"/><path d="m2 2 20 20"/><path d="M9 9v3a3 3 0 0 0 5.12 2.12"/></symbol><symbol id="i-refresh-cw" viewBox="0 0 24 24"><path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"/><path d="M8 16H3v5"/></symbol><symbol id="i-switch-camera" viewBox="0 0 24 24"><path d="M11 19H4a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h5"/><path d="M13 5h7a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2h-5"/><circle cx="12" cy="12" r="3"/><path d="m18 22 3-3-3-3"/><path d="m6 2-3 3 3 3"/></symbol><symbol id="i-paperclip" viewBox="0 0 24 24"><path d="m16 6-8.414 8.586a2 2 0 0 0 2.829 2.829l8.414-8.586a4 4 0 1 0-5.657-5.657l-8.379 8.551a6 6 0 1 0 8.485 8.485l8.379-8.551"/></symbol><symbol id="i-send" viewBox="0 0 24 24"><path d="M14.536 21.686a.5.5 0 0 0 .937-.024l6.5-19a.496.496 0 0 0-.635-.635l-19 6.5a.5.5 0 0 0-.024.937l7.93 3.18a2 2 0 0 1 1.112 1.11z"/><path d="m21.854 2.147-10.94 10.939"/></symbol><symbol id="i-message-square" viewBox="0 0 24 24"><path d="M22 17a2 2 0 0 1-2 2H6.828a2 2 0 0 0-1.414.586l-2.202 2.202A.71.71 0 0 1 2 21.286V5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2z"/></symbol><symbol id="i-users" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><path d="M16 3.128a4 4 0 0 1 0 7.744"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><circle cx="9" cy="7" r="4"/></symbol><symbol id="i-user-plus" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><line x1="19" x2="19" y1="8" y2="14"/><line x1="22" x2="16" y1="11" y2="11"/></symbol><symbol id="i-qr-code" viewBox="0 0 24 24"><rect width="5" height="5" x="3" y="3" rx="1"/><rect width="5" height="5" x="16" y="3" rx="1"/><rect width="5" height="5" x="3" y="16" rx="1"/><path d="M21 16h-3a2 2 0 0 0-2 2v3"/><path d="M21 21v.01"/><path d="M12 7v3a2 2 0 0 1-2 2H7"/><path d="M3 12h.01"/><path d="M12 3h.01"/><path d="M12 16v.01"/><path d="M16 12h1"/><path d="M21 12v.01"/><path d="M12 21v-1"/></symbol><symbol id="i-scan-line" viewBox="0 0 24 24"><path d="M3 7V5a2 2 0 0 1 2-2h2"/><path d="M17 3h2a2 2 0 0 1 2 2v2"/><path d="M21 17v2a2 2 0 0 1-2 2h-2"/><path d="M7 21H5a2 2 0 0 1-2-2v-2"/><path d="M7 12h10"/></symbol><symbol id="i-grid-3x3" viewBox="0 0 24 24"><rect width="18" height="18" x="3" y="3" rx="2"/><path d="M3 9h18"/><path d="M3 15h18"/><path d="M9 3v18"/><path d="M15 3v18"/></symbol><symbol id="i-cloud-upload" viewBox="0 0 24 24"><path d="M12 13v8"/><path d="M4 14.899A7 7 0 1 1 15.71 8h1.79a4.5 4.5 0 0 1 2.5 8.242"/><path d="m8 17 4-4 4 4"/></symbol><symbol id="i-folder-plus" viewBox="0 0 24 24"><path d="M12 10v6"/><path d="M9 13h6"/><path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"/></symbol><symbol id="i-folder" viewBox="0 0 24 24"><path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"/></symbol><symbol id="i-trash-2" viewBox="0 0 24 24"><path d="M10 11v6"/><path d="M14 11v6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/><path d="M3 6h18"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></symbol><symbol id="i-upload" viewBox="0 0 24 24"><path d="M12 3v12"/><path d="m17 8-5-5-5 5"/><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/></symbol><symbol id="i-image" viewBox="0 0 24 24"><rect width="18" height="18" x="3" y="3" rx="2" ry="2"/><circle cx="9" cy="9" r="2"/><path d="m21 15-3.086-3.086a2 2 0 0 0-2.828 0L6 21"/></symbol><symbol id="i-film" viewBox="0 0 24 24"><rect width="18" height="18" x="3" y="3" rx="2"/><path d="M7 3v18"/><path d="M3 7.5h4"/><path d="M3 12h18"/><path d="M3 16.5h4"/><path d="M17 3v18"/><path d="M17 7.5h4"/><path d="M17 16.5h4"/></symbol><symbol id="i-music" viewBox="0 0 24 24"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></symbol><symbol id="i-file-text" viewBox="0 0 24 24"><path d="M6 22a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h8a2.4 2.4 0 0 1 1.704.706l3.588 3.588A2.4 2.4 0 0 1 20 8v12a2 2 0 0 1-2 2z"/><path d="M14 2v5a1 1 0 0 0 1 1h5"/><path d="M10 9H8"/><path d="M16 13H8"/><path d="M16 17H8"/></symbol><symbol id="i-file" viewBox="0 0 24 24"><path d="M6 22a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h8a2.4 2.4 0 0 1 1.704.706l3.588 3.588A2.4 2.4 0 0 1 20 8v12a2 2 0 0 1-2 2z"/><path d="M14 2v5a1 1 0 0 0 1 1h5"/></symbol><symbol id="i-file-spreadsheet" viewBox="0 0 24 24"><path d="M6 22a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h8a2.4 2.4 0 0 1 1.704.706l3.588 3.588A2.4 2.4 0 0 1 20 8v12a2 2 0 0 1-2 2z"/><path d="M14 2v5a1 1 0 0 0 1 1h5"/><path d="M8 13h2"/><path d="M14 13h2"/><path d="M8 17h2"/><path d="M14 17h2"/></symbol><symbol id="i-presentation" viewBox="0 0 24 24"><path d="M2 3h20"/><path d="M21 3v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V3"/><path d="m7 21 5-5 5 5"/></symbol><symbol id="i-archive" viewBox="0 0 24 24"><rect width="20" height="5" x="2" y="3" rx="1"/><path d="M4 8v11a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8"/><path d="M10 12h4"/></symbol><symbol id="i-settings" viewBox="0 0 24 24"><path d="M9.671 4.136a2.34 2.34 0 0 1 4.659 0 2.34 2.34 0 0 0 3.319 1.915 2.34 2.34 0 0 1 2.33 4.033 2.34 2.34 0 0 0 0 3.831 2.34 2.34 0 0 1-2.33 4.033 2.34 2.34 0 0 0-3.319 1.915 2.34 2.34 0 0 1-4.659 0 2.34 2.34 0 0 0-3.32-1.915 2.34 2.34 0 0 1-2.33-4.033 2.34 2.34 0 0 0 0-3.831A2.34 2.34 0 0 1 6.35 6.051a2.34 2.34 0 0 0 3.319-1.915"/><circle cx="12" cy="12" r="3"/></symbol><symbol id="i-camera" viewBox="0 0 24 24"><path d="M13.997 4a2 2 0 0 1 1.76 1.05l.486.9A2 2 0 0 0 18.003 7H20a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V9a2 2 0 0 1 2-2h1.997a2 2 0 0 0 1.759-1.048l.489-.904A2 2 0 0 1 10.004 4z"/><circle cx="12" cy="13" r="3"/></symbol><symbol id="i-pencil" viewBox="0 0 24 24"><path d="M21.174 6.812a1 1 0 0 0-3.986-3.987L3.842 16.174a2 2 0 0 0-.5.83l-1.321 4.352a.5.5 0 0 0 .623.622l4.353-1.32a2 2 0 0 0 .83-.497z"/><path d="m15 5 4 4"/></symbol><symbol id="i-copy" viewBox="0 0 24 24"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></symbol><symbol id="i-search" viewBox="0 0 24 24"><path d="m21 21-4.34-4.34"/><circle cx="11" cy="11" r="8"/></symbol><symbol id="i-chevron-left" viewBox="0 0 24 24"><path d="m15 18-6-6 6-6"/></symbol><symbol id="i-chevron-down" viewBox="0 0 24 24"><path d="m6 9 6 6 6-6"/></symbol><symbol id="i-circle-alert" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="12" x2="12" y1="8" y2="12"/><line x1="12" x2="12.01" y1="16" y2="16"/></symbol><symbol id="i-x" viewBox="0 0 24 24"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></symbol><symbol id="i-play" viewBox="0 0 24 24"><path d="M5 5a2 2 0 0 1 3.008-1.728l11.997 6.998a2 2 0 0 1 .003 3.458l-12 7A2 2 0 0 1 5 19z"/></symbol><symbol id="i-square" viewBox="0 0 24 24"><rect width="18" height="18" x="3" y="3" rx="2"/></symbol><symbol id="i-log-in" viewBox="0 0 24 24"><path d="m10 17 5-5-5-5"/><path d="M15 12H3"/><path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4"/></symbol><symbol id="i-shield-check" viewBox="0 0 24 24"><path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z"/><path d="m9 12 2 2 4-4"/></symbol><symbol id="i-shield" viewBox="0 0 24 24"><path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z"/></symbol><symbol id="i-credit-card" viewBox="0 0 24 24"><rect width="20" height="14" x="2" y="5" rx="2"/><line x1="2" x2="22" y1="10" y2="10"/></symbol><symbol id="i-mic" viewBox="0 0 24 24"><path d="M12 19v3"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><rect x="9" y="2" width="6" height="13" rx="3"/></symbol><symbol id="i-volume-2" viewBox="0 0 24 24"><path d="M11 4.702a.705.705 0 0 0-1.203-.498L6.413 7.587A1.4 1.4 0 0 1 5.416 8H3a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2.416a1.4 1.4 0 0 1 .997.413l3.383 3.384A.705.705 0 0 0 11 19.298z"/><path d="M16 9a5 5 0 0 1 0 6"/><path d="M19.364 18.364a9 9 0 0 0 0-12.728"/></symbol><symbol id="i-eye" viewBox="0 0 24 24"><path d="M2.062 12.348a1 1 0 0 1 0-.696 10.75 10.75 0 0 1 19.876 0 1 1 0 0 1 0 .696 10.75 10.75 0 0 1-19.876 0"/><circle cx="12" cy="12" r="3"/></symbol><symbol id="i-smile" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M8 14s1.5 2 4 2 4-2 4-2"/><line x1="9" x2="9.01" y1="9" y2="9"/><line x1="15" x2="15.01" y1="9" y2="9"/></symbol></svg>
+  <div id="uatBadge" class="uat-badge">U A T</div>
+  <script>if(window.APP_ENV&&window.APP_ENV!=='production'){document.getElementById('uatBadge').classList.add('visible')}</script>
+  <script>
+  // Early brand hydration: read brand info from sessionStorage before modules load.
+  // This only works for the login→app same-tab transition: SDM exchange on login.html
+  // writes brand_name/brand_logo to sessionStorage, and app.html reads them here.
+  // On a fresh tab or after logout this will be empty — applyBrand() handles it later.
+  (function(){
+    try {
+      var bk = sessionStorage.getItem('brand');
+      if (!bk) return;
+      var bn = sessionStorage.getItem('brand_name');
+      var bl = sessionStorage.getItem('brand_logo');
+      // Fall back to built-in brand config if no dynamic name/logo
+      if (!bn && !bl) {
+        var brands = {
+          sentry: { name: 'SENTRY MESSENGER', logo: '/assets/images/logo.svg', favicon: '/assets/favicon.ico' }
+        };
+        var b = brands[bk];
+        if (!b) return;
+        bn = b.name;
+        bl = b.logo;
+      }
+      if (bn) window.__BRAND_NAME = bn;
+      if (bl) {
+        window.__BRAND_LOGO = bl;
+        window.__BRAND_LOGO_SVG = /\.svg(?:[?#]|$)/i.test(bl);
+        // Legacy compat — external means "not a local monochrome SVG"
+        window.__BRAND_LOGO_EXTERNAL = !window.__BRAND_LOGO_SVG;
+      }
+      if (bn && document.title) document.title = document.title.replace(/SENTRY MESSENGER/g, bn);
+      var fav = document.querySelector('link[rel="icon"]');
+      if (fav) {
+        var brands2 = { sentry: { favicon: '/assets/favicon.ico' } };
+        var bf = brands2[bk];
+        if (bf && bf.favicon) fav.href = bf.favicon;
+      }
+    } catch(e){}
+  })();
+  // Shared inline helper: fetch an SVG, rewrite all colors to white, set as data URI.
+  // Used by early hydration scripts before ES modules are available.
+  window.__monoLogo = function(img, url, shadow) {
+    try {
+      fetch(url).then(function(r) {
+        if (!r.ok) return;
+        var ct = r.headers.get('content-type') || '';
+        if (!ct.match(/svg|xml/i)) { img.classList.add('color-logo'); return; }
+        return r.text();
+      }).then(function(txt) {
+        if (!txt) return;
+        var doc = new DOMParser().parseFromString(txt, 'image/svg+xml');
+        if (doc.querySelector('parsererror')) return;
+        var svg = doc.documentElement;
+        // Rewrite inline fill/stroke attributes
+        var els = svg.querySelectorAll('*');
+        for (var i = 0; i < els.length; i++) {
+          var attrs = ['fill', 'stroke'];
+          for (var j = 0; j < attrs.length; j++) {
+            if (els[i].hasAttribute(attrs[j])) {
+              var v = els[i].getAttribute(attrs[j]).trim().toLowerCase();
+              if (v === 'none' || v === 'transparent' || v.indexOf('url(') === 0) continue;
+              els[i].setAttribute(attrs[j], '#ffffff');
+            }
+          }
+        }
+        // Rewrite <style> blocks
+        var styles = svg.querySelectorAll('style');
+        for (var i = 0; i < styles.length; i++) {
+          styles[i].textContent = styles[i].textContent
+            .replace(/fill\s*:\s*(?!none|transparent|url\()[^;}\s]+/gi, 'fill: #ffffff')
+            .replace(/stroke\s*:\s*(?!none|transparent|url\()[^;}\s]+/gi, 'stroke: #ffffff');
+        }
+        if (!svg.hasAttribute('fill') && !(svg.style && svg.style.fill)) svg.setAttribute('fill', '#ffffff');
+        var out = new XMLSerializer().serializeToString(doc);
+        img.src = 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(out);
+        img.classList.add('mono-done');
+      }).catch(function(){});
+    } catch(e){}
+  };
+  </script>
+  <!-- Loading Modal — visible instantly, dismissed after hydration -->
+  <div id="appLoadingModal">
+    <canvas class="app-tm-canvas" id="appTmCanvas"></canvas>
+    <div class="app-tm-overlay"></div>
+    <div class="app-tm-content">
+      <img class="loading-logo" id="appLoadingLogo" src="/assets/images/logo.svg" alt="" />
+      <div class="loading-brand" id="appLoadingBrand">SENTRY MESSENGER</div>
+      <div class="loading-sublabel" data-i18n="auth.e2eeEncrypted"></div>
+      <div class="loading-bar-track" id="appEnterBtn">
+        <div id="appLoadingBar" class="loading-bar-fill"></div>
+        <div class="loading-bar-scan"></div>
+        <span id="appEnterLabel" class="loading-enter-label" data-i18n="auth.enterButton"></span>
+      </div>
+      <div id="appLoadingLabel" class="loading-label" data-i18n="auth.loadingSecureSession"></div>
+      <div id="appLoadingStatus" class="loading-status"></div>
+      <button id="appLoadingSkip" class="loading-skip" data-i18n="auth.skipForNow"></button>
+    </div>
+  </div>
+  <script>if (window.__i18nApply) window.__i18nApply();</script>
+  <script>
+  // Apply brand to loading modal elements.
+  // SVG logos: sync brightness(0) invert(1) first, then async fetch+rewrite to white.
+  // Non-SVG logos: show as-is (no filter).
+  (function(){
+    var bn = window.__BRAND_NAME;
+    var bl = window.__BRAND_LOGO;
+    var isSvg = window.__BRAND_LOGO_SVG;
+    var GLOW = 'drop-shadow(0 0 18px rgba(56,189,248,0.45)) drop-shadow(0 0 40px rgba(99,102,241,0.25))';
+    if (bn) {
+      var e = document.getElementById('appLoadingBrand');
+      if (e) e.textContent = bn;
+    }
+    if (bl) {
+      var img = document.getElementById('appLoadingLogo');
+      if (img) {
+        img.src = bl;
+        if (isSvg) {
+          // Sync: CSS brightness(0) invert(1) already from stylesheet @keyframes.
+          // Async: fetch SVG, rewrite fills to white, replace as data URI.
+          window.__monoLogo(img, bl, GLOW);
+        } else {
+          // Non-SVG: assume full-color, use glow-only animation
+          img.classList.add('color-logo');
+        }
+      }
+    }
+  })();
+  </script>
+  <script>
+  /* ── App Loading: Matrix Rain ── */
+  (function(){
+    var cvs, ctx, w, h, raf, columns, drops, running = false;
+    var CHARS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789アイウエオカキクケコサシスセソ$@#&%!?<>{}[]';
+    var FS = 13;
+    function init(){
+      cvs = document.getElementById('appTmCanvas');
+      if(!cvs) return;
+      ctx = cvs.getContext('2d');
+      resize();
+      window.addEventListener('resize', resize);
+    }
+    function resize(){
+      if(!cvs) return;
+      w = cvs.width = cvs.parentElement.clientWidth;
+      h = cvs.height = cvs.parentElement.clientHeight;
+      columns = Math.floor(w / FS);
+      var maxRow = Math.floor(h / FS);
+      drops = [];
+      for(var i=0;i<columns;i++){
+        // 40% of columns start mid-screen so canvas looks pre-populated on load
+        drops[i] = Math.random() < 0.4 ? (Math.random()*maxRow|0) : -(Math.random()*80|0);
+      }
+    }
+    function tick(){
+      if(!running) return;
+      ctx.fillStyle = 'rgba(5,10,20,0.12)';
+      ctx.fillRect(0,0,w,h);
+      ctx.font = FS + 'px monospace';
+      for(var i=0;i<columns;i++){
+        if(drops[i]<0){ drops[i]++; continue; }
+        var ch = CHARS[Math.random()*CHARS.length|0];
+        var y = drops[i] * FS;
+        ctx.fillStyle = 'rgba(16,185,129,0.7)';
+        ctx.fillText(ch, i*FS, y);
+        if(y > FS){
+          ctx.fillStyle = 'rgba(16,185,129,0.08)';
+          ctx.fillText(CHARS[Math.random()*CHARS.length|0], i*FS, y - FS);
+        }
+        drops[i]++;
+        if(y > h && Math.random() > 0.975) drops[i] = 0;
+      }
+      raf = requestAnimationFrame(tick);
+    }
+    // Auto-start — pre-draw several frames so canvas looks populated immediately
+    running = true;
+    init();
+    if(ctx){
+      ctx.fillStyle='#050a14'; ctx.fillRect(0,0,w,h);
+      // Silently advance a few frames to seed visible characters
+      ctx.font = FS + 'px monospace';
+      for(var f=0;f<8;f++){
+        ctx.fillStyle='rgba(5,10,20,0.12)'; ctx.fillRect(0,0,w,h);
+        for(var i=0;i<columns;i++){
+          if(drops[i]<0){ drops[i]++; continue; }
+          var ch=CHARS[Math.random()*CHARS.length|0];
+          var y=drops[i]*FS;
+          ctx.fillStyle='rgba(16,185,129,0.7)'; ctx.fillText(ch,i*FS,y);
+          if(y>FS){ ctx.fillStyle='rgba(16,185,129,0.08)'; ctx.fillText(CHARS[Math.random()*CHARS.length|0],i*FS,y-FS); }
+          drops[i]++;
+          if(y>h&&Math.random()>0.975) drops[i]=0;
+        }
+      }
+    }
+    tick();
+    // Expose stop so __hideLoadingModal can call it
+    window.__appTmStop = function(){ running = false; if(raf) cancelAnimationFrame(raf); };
+  })();
+  </script>
+  <script>
+    (function () {
+      function _t(k, p) { return typeof window.__t === 'function' ? window.__t(k, p) : k; }
+      var stages = {
+        styles:        { label: _t('auth.loadingInterface'),       progress: 74 },
+        scripts:       { label: _t('auth.loadingModules'),         progress: 80 },
+        account:       { label: _t('auth.syncingAccountData'),     progress: 86 },
+        contacts:      { label: _t('auth.syncingContacts'),        progress: 92 },
+        conversations: { label: _t('auth.syncingConversations'),   progress: 96 },
+        ready:         { label: _t('auth.systemReady'),            progress: 100 }
+      };
+      var bar   = document.getElementById('appLoadingBar');
+      var label = document.getElementById('appLoadingLabel');
+      var modal = document.getElementById('appLoadingModal');
+      var current = 70;
+      var fillRAF = null;
+      var fillTarget = 0;
+      var fillLast = 0;
+      var FILL_SPEED = 10;
+      function setBarWidth(pct) { if (bar) bar.style.width = pct + '%'; }
+      function startSlowFill(target) {
+        fillTarget = target;
+        if (fillRAF) return;
+        fillLast = performance.now();
+        function tick(now) {
+          var dt = (now - fillLast) / 1000;
+          fillLast = now;
+          if (current < fillTarget - 0.3) {
+            current = Math.min(current + FILL_SPEED * dt, fillTarget - 0.3);
+            setBarWidth(current);
+            fillRAF = requestAnimationFrame(tick);
+          } else {
+            fillRAF = null;
+          }
+        }
+        fillRAF = requestAnimationFrame(tick);
+      }
+      function stopSlowFill() {
+        if (fillRAF) { cancelAnimationFrame(fillRAF); fillRAF = null; }
+      }
+      window.__updateLoadingProgress = function (stageId) {
+        var stage = stages[stageId];
+        if (!stage || stage.progress <= current) return;
+        stopSlowFill();
+        current = stage.progress;
+        setBarWidth(current);
+        if (label) label.textContent = stage.label;
+        // Find next stage to slowly fill toward
+        var keys = Object.keys(stages);
+        var idx = keys.indexOf(stageId);
+        if (idx >= 0 && idx < keys.length - 1) {
+          startSlowFill(stages[keys[idx + 1]].progress);
+        }
+      };
+      window.__hideLoadingModal = function () {
+        stopSlowFill();
+        if (typeof window.__appTmStop === 'function') window.__appTmStop();
+        if (!modal) return;
+        modal.classList.add('glitch-out');
+        setTimeout(function () { if (modal.parentNode) modal.parentNode.removeChild(modal); }, 750);
+      };
+      /* ── Morph progress bar into "Enter" button ── */
+      window.__morphToEnterButton = function () {
+        stopSlowFill();
+        current = 100;
+        setBarWidth(100);
+        if (label) label.textContent = _t('auth.systemReady');
+        setTimeout(function () {
+          if (modal) modal.classList.add('morph-enter');
+          if (label) { label.textContent = _t('auth.clickToEnableSecureComm'); label.style.letterSpacing = '1.5px'; }
+        }, 600);
+      };
+      window.__setSplashStatus = function (msg) {
+        var el = document.getElementById('appLoadingStatus');
+        if (el) el.textContent = msg || '';
+      };
+      window.__setSplashAuthorizing = function (active) {
+        if (!modal) return;
+        var enterLabel = document.getElementById('appEnterLabel');
+        if (active) {
+          modal.classList.add('morph-authorizing');
+          if (enterLabel) enterLabel.textContent = _t('auth.authorizing');
+          if (label) label.textContent = _t('auth.promptAllowInSystemWindow');
+        } else {
+          modal.classList.remove('morph-authorizing');
+          if (enterLabel) enterLabel.textContent = _t('auth.enterButton');
+          if (label) { label.textContent = _t('auth.clickToEnableSecureComm'); label.style.letterSpacing = '1.5px'; }
+        }
+      };
+      window.__setSplashSuccess = function () {
+        if (!modal) return;
+        modal.classList.add('morph-success');
+        modal.classList.remove('morph-authorizing');
+        var enterLabel = document.getElementById('appEnterLabel');
+        if (enterLabel) enterLabel.textContent = '\u2713';
+        if (label) label.textContent = _t('auth.authSuccess');
+        setTimeout(function () { window.__hideLoadingModal(); }, 800);
+      };
+      // Auto-advance to 'styles' when all async CSS is loaded
+      var cssDone = false;
+      var cssLinks = document.querySelectorAll('link[rel="stylesheet"][media="print"]');
+      var loaded = 0;
+      var total = cssLinks.length;
+      function markCssDone() {
+        if (cssDone) return;
+        cssDone = true;
+        window.__updateLoadingProgress('styles');
+      }
+      function onCssLoad() {
+        loaded++;
+        if (loaded >= total) markCssDone();
+      }
+      for (var i = 0; i < cssLinks.length; i++) {
+        cssLinks[i].addEventListener('load', onCssLoad);
+      }
+      if (total === 0) markCssDone();
+      // Safety: if cached CSS already switched media before this script ran, or onload failed
+      setTimeout(function () {
+        if (!cssDone) markCssDone();
+      }, 3000);
+      // Start slow-fill immediately from 70% toward first stage (74%)
+      startSlowFill(stages.styles.progress);
+    })();
+  </script>
+
+  <div id="orientationOverlay" class="orientation-overlay" aria-hidden="true">
+    <span class="icon" aria-hidden="true">📱</span>
+    <strong data-i18n="orientation.usePortrait"></strong>
+    <span data-i18n="orientation.rotateBackMessage"></span>
+  </div>
+  <header class="topbar">
+    <div class="title">
+      <img class="brand" id="appHeaderLogo" src="/assets/images/logo.svg" alt="SENTRY MESSENGER" />
+      <span id="appHeaderBrandName">SENTRY</span>
+      <span id="connectionIndicator" class="connection-indicator" aria-live="polite" data-ws-path="/api/ws"
+        data-ws-host=""><span class="dot" aria-hidden="true"></span><span data-i18n="status.offline"></span></span>
+    </div>
+    <div class="actions">
+      <div id="userMenu" class="user-menu">
+        <button id="btnUserMenu" class="user-avatar-btn" type="button" aria-haspopup="true" aria-expanded="false"
+          data-i18n-aria-label="nav.openUserMenu">
+          <span class="user-avatar-wrap" id="userAvatarWrap">
+            <img id="headerAvatarImg" src="/assets/images/avatar.png" data-i18n-alt="nav.userAvatar" alt="User avatar" />
+            <span class="user-menu-badge" id="userMenuBadge" aria-hidden="true">!</span>
+          </span>
+        </button>
+        <div id="userMenuDropdown" class="user-menu-dropdown" role="menu" aria-hidden="true">
+          <button class="user-menu-item" type="button" data-action="settings" role="menuitem" data-i18n="settings.title"></button>
+          <button class="user-menu-item" type="button" data-action="subscription" id="userMenuSubscriptionBtn"
+            role="menuitem">
+            <span data-i18n="subscription.subscriptionStatusTab"></span>
+            <span class="menu-item-badge" aria-hidden="true">!</span>
+          </button>
+          <button class="user-menu-item" type="button" data-action="version-info" id="userMenuVersionBtn"
+            role="menuitem" data-i18n="versionInfo.title"></button>
+          <div class="version-info-menu" id="versionInfoPopupAppMenu" aria-hidden="true"></div>
+          <div class="user-menu-divider" role="presentation"></div>
+          <button class="user-menu-item logout" type="button" data-action="logout" role="menuitem" data-i18n="auth.logout"></button>
+        </div>
+      </div>
+    </div>
+  </header>
+  <script>
+  // Apply brand to app header (runs after header is in DOM)
+  (function(){
+    var bn = window.__BRAND_NAME;
+    var bl = window.__BRAND_LOGO;
+    var isSvg = window.__BRAND_LOGO_SVG;
+    if (bn) {
+      var h = document.getElementById('appHeaderBrandName');
+      if (h) h.textContent = bn.split(' ')[0];
+      var logo = document.getElementById('appHeaderLogo');
+      if (logo) logo.alt = bn;
+    }
+    if (bl) {
+      var logo = document.getElementById('appHeaderLogo');
+      if (logo) {
+        logo.src = bl;
+        if (isSvg) {
+          logo.style.filter = 'brightness(0) invert(1)';
+          window.__monoLogo(logo, bl, '');
+        } else {
+          logo.style.filter = 'none';
+        }
+      }
+    }
+  })();
+  </script>
+
+  <main class="content">
+    <section id="tab-contacts" class="tab">
+      <div class="card contacts-card">
+        <div id="contactsRefreshHint" class="contacts-refresh">
+          <svg class="icon icon-lg" aria-hidden="true"><use href="#i-refresh-cw"/></svg>
+          <span class="label" data-i18n="contacts.pullToRefresh"></span>
+        </div>
+        <div id="contactsScroll" class="contacts-scroll">
+          <div class="contact-list-header">
+            <span><strong id="contactsCount">0</strong> <span data-i18n="contacts.friendCount"></span></span>
+            <div class="add-friend-wrapper">
+              <button id="btnContactsAddFriend" class="contacts-add-btn" type="button" data-i18n-aria-label="contacts.addFriend" data-i18n-title="contacts.addFriend">
+                <svg class="icon"><use href="#i-user-plus"/></svg>
+              </button>
+              <div id="contactsAddFriendMenu" class="add-friend-menu add-friend-menu--below" style="display:none">
+                <button id="btnContactsAddFriendQr" class="add-friend-menu-item" type="button">
+                  <svg class="icon"><use href="#i-qr-code"/></svg>
+                  <span data-i18n="contacts.qrAddFriend"></span>
+                </button>
+                <button id="btnContactsAddFriendCode" class="add-friend-menu-item" type="button">
+                  <svg class="icon"><use href="#i-grid-3x3"/></svg>
+                  <span data-i18n="contacts.usePairingCode"></span>
+                </button>
+              </div>
+            </div>
+          </div>
+          <div class="contacts-search-wrap">
+            <svg class="icon" aria-hidden="true"><use href="#i-search"/></svg>
+            <input id="contactsSearch" type="text" class="contacts-search" data-i18n-placeholder="contacts.searchPlaceholder" placeholder="Search friends…" autocomplete="off" />
+          </div>
+          <ul id="contactsList" class="contact-list"></ul>
+        </div>
+      </div>
+    </section>
+    <section id="tab-messages" class="tab">
+      <div class="messages-pane">
+        <div class="messages-body">
+          <aside class="messages-sidebar">
+            <div id="conversationRefresh" class="conversation-refresh">
+              <svg class="icon icon-lg" aria-hidden="true"><use href="#i-refresh-cw"/></svg>
+              <span class="label" data-i18n="messages.pullToRefreshConversations"></span>
+            </div>
+            <div id="groupDrafts" class="conversation-group-drafts" aria-live="polite" style="display:none"
+              aria-hidden="true"></div>
+            <div id="quickActionsToggle" class="quick-actions-toggle" aria-label="展開快速操作">
+              <svg class="quick-actions-chevron" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+                <polyline points="6 9 12 15 18 9"/>
+              </svg>
+            </div>
+            <div class="conversation-quick-actions collapsed" id="conversationQuickActions">
+              <button id="btnCreateEphemeralLink" type="button" class="quick-action-btn quick-action-ephemeral" aria-label="建立臨時對話連結">
+                <span class="quick-action-icon">
+                  <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" stroke-dasharray="3 2">
+                    <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
+                  </svg>
+                </span>
+                <span class="quick-action-label" data-i18n="ephemeral.quickAction">Temp Chat</span>
+              </button>
+              <!-- Business conversation button hidden for now -->
+              <button id="btnCreateBusinessChat" type="button" class="quick-action-btn quick-action-business" aria-label="建立商業對話" style="display:none">
+                <span class="quick-action-icon">
+                  <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                    <rect x="2" y="7" width="20" height="14" rx="2" ry="2"/><path d="M16 7V5a2 2 0 0 0-2-2h-4a2 2 0 0 0-2 2v2"/><line x1="12" y1="12" x2="12" y2="12.01"/>
+                  </svg>
+                </span>
+                <span class="quick-action-label" data-i18n="ephemeral.businessChat">Business</span>
+              </button>
+            </div>
+            <ul id="conversationList" class="conversation-list"></ul>
+          </aside>
+          <div class="messages-thread">
+            <div class="messages-header">
+              <button id="messagesBackBtn" type="button" class="messages-back hidden" data-i18n-aria-label="misc.backToConversationList"><svg class="icon"><use href="#i-chevron-left"/></svg></button>
+              <div id="messagesPeerAvatar" class="messages-peer-avatar"></div>
+              <div class="messages-header-meta">
+                <strong id="messagesPeerName" data-i18n="contacts.selectToChat"></strong>
+                <span id="messagesStatus" class="status"></span>
+              </div>
+              <div class="messages-actions">
+                <span id="messagesWsIndicator" class="connection-indicator messages-ws-indicator"
+                  aria-hidden="true"><span class="dot" aria-hidden="true"></span></span>
+                <button id="bizConvSettingsBtn" type="button" class="messages-action-btn biz-conv-settings-btn hidden" aria-label="Group Settings"><svg class="icon"><use href="#i-settings"/></svg></button>
+                <div class="call-menu-wrapper">
+                  <button id="messagesCallBtn" type="button" class="messages-action-btn" data-i18n-aria-label="calls.title" data-i18n-title="calls.title"
+                    disabled><svg class="icon"><use href="#i-phone"/></svg></button>
+                  <div id="callSubmenu" class="call-submenu hidden">
+                    <button type="button" class="call-submenu-item" data-call-type="voice">
+                      <svg class="icon"><use href="#i-phone"/></svg><span data-i18n="calls.voiceCall"></span>
+                    </button>
+                    <button type="button" class="call-submenu-item" data-call-type="video">
+                      <svg class="icon"><use href="#i-video"/></svg><span data-i18n="calls.videoCall"></span>
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </div>
+            <div id="messagesScroll" class="messages-scroll">
+              <div id="messagesLoadMore" class="messages-load-more hidden" role="status">
+                <span class="label" data-i18n="common.loadMore"></span>
+                <span class="spinner" aria-hidden="true"></span>
+              </div>
+              <div id="messagesEmpty" class="messages-empty">
+                <svg class="icon" aria-hidden="true"><use href="#i-message-circle"/></svg>
+                <p class="messages-empty-title" data-i18n="messages.noConversationSelected"></p>
+                <p class="messages-empty-hint" data-i18n="messages.selectConversationToChat"></p>
+              </div>
+              <ul id="messagePlaceholders" class="messages-list messages-placeholders"></ul>
+              <ul id="messagesList" class="messages-list"></ul>
+            </div>
+            <div id="subscriptionExpiredBanner" class="subscription-expired-banner" style="display:none">
+              <span data-i18n="subscription.expiredBanner">Your subscription has expired. Renew to continue messaging.</span>
+              <button type="button" id="subscriptionExpiredBannerBtn" class="subscription-expired-banner-btn" data-i18n="subscription.clickToTopUp">Top Up</button>
+            </div>
+            <form id="messageComposer" class="messages-composer">
+              <button id="composerAttach" type="button" class="composer-attach" data-i18n-aria-label="messages.attachFile"><svg class="icon"><use href="#i-paperclip"/></svg></button>
+              <input id="messageFileInput" type="file" class="sr-only" style="display:none" />
+              <textarea id="messageInput" data-i18n-placeholder="messages.inputPlaceholder" placeholder="Enter message…" rows="1" maxlength="1024"></textarea>
+              <button id="messageSend" type="submit" class="composer-send" data-i18n-aria-label="messages.sendMessage"><svg class="icon"><use href="#i-send"/></svg></button>
+            </form>
+          </div>
+        </div>
+      </div>
+    </section>
+    <section id="tab-drive" class="tab">
+      <div id="driveRefreshHint" class="drive-refresh">
+        <svg class="icon icon-lg" aria-hidden="true"><use href="#i-refresh-cw"/></svg>
+        <span class="label" data-i18n="drive.pullToRefresh"></span>
+      </div>
+      <div class="drive-usage" aria-live="polite">
+        <span class="drive-usage-label" data-i18n="drive.cloudSpace"></span>
+        <span class="drive-usage-amount">
+          <span id="driveUsageValue">0 B</span>
+          <span id="driveUsageTotal" class="drive-usage-total">/ 3 GB</span>
+        </span>
+        <div id="driveUsageProgress" class="drive-usage-bar" role="progressbar" data-i18n-aria-label="drive.encryptedCloudUsage" aria-label="Encrypted cloud usage" aria-valuemin="0"
+          aria-valuemax="100" aria-valuenow="0" aria-valuetext="0 B / 3 GB">
+          <div id="driveUsageBar" class="drive-usage-bar-fill"></div>
+        </div>
+        <span id="driveUsagePercent" class="drive-usage-percent">0%</span>
+      </div>
+      <div class="card">
+        <div class="list-header">
+          <div style="display:flex;flex-direction:column;gap:6px;">
+            <h3 style="margin:0" data-i18n="drive.fileList"></h3>
+            <nav id="driveCrumb" class="crumb" style="font-size:13px"></nav>
+          </div>
+          <div class="list-actions">
+            <button id="btnUp" type="button" class="secondary" style="display:none" data-i18n-aria-label="drive.goUp" data-i18n-title="drive.goUp"
+              aria-live="polite">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"
+                aria-hidden="true">
+                <path d="M18 16H9V9" stroke="#0f172a" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
+                <path d="M9 9L6 12" stroke="#0f172a" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
+                <path d="M9 9L12 12" stroke="#0f172a" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
+              </svg>
+            </button>
+            <button id="btnUploadOpen" type="button" class="secondary" data-i18n-aria-label="drive.uploadFile" data-i18n-title="drive.uploadFile"><svg class="icon"><use href="#i-cloud-upload"/></svg></button>
+            <button id="btnNewFolder" type="button" class="secondary" data-i18n-aria-label="drive.newFolder" data-i18n-title="drive.newFolder"><svg class="icon"><use href="#i-folder-plus"/></svg></button>
+          </div>
+        </div>
+        <ul id="driveList" class="list"></ul>
+      </div>
+    </section>
+    <section id="tab-apps" class="tab" style="display:none">
+      <div id="appsContainer" style="padding:16px;"></div>
+    </section>
+
+    <section id="tab-safe" class="tab" style="display:none">
+      <div style="padding:16px;">
+        <!-- Header -->
+        <div style="text-align:center;margin-bottom:20px;">
+          <div style="font-size:22px;font-weight:700;letter-spacing:1px;" data-i18n="safe.brand">SAFE™</div>
+          <div style="font-size:11px;color:var(--muted);margin-top:2px;" data-i18n="safe.tagline">Secure Application Frontend Environment</div>
+        </div>
+
+        <!-- Status card -->
+        <div class="card" style="padding:16px;margin-bottom:16px;">
+          <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;">
+            <span style="font-size:13px;font-weight:600;" data-i18n="safe.containerStatus">Instance Status</span>
+            <span id="safe-status-badge" style="font-size:11px;padding:3px 10px;border-radius:12px;font-weight:600;background:var(--bg-hover);color:var(--muted);">--</span>
+          </div>
+          <div style="display:flex;flex-direction:column;gap:8px;font-size:12px;color:var(--muted);">
+            <div style="display:flex;justify-content:space-between;">
+              <span data-i18n="safe.statusLabel">Status</span>
+              <span id="safe-status-text">--</span>
+            </div>
+            <div style="display:flex;justify-content:space-between;">
+              <span data-i18n="safe.elapsedLabel">Uptime</span>
+              <span id="safe-elapsed-text">--</span>
+            </div>
+            <div style="display:flex;justify-content:space-between;">
+              <span data-i18n="safe.port">Port</span>
+              <span id="safe-port-text">6901</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- Actions -->
+        <div style="display:flex;gap:8px;margin-bottom:16px;">
+          <button id="safe-btn-start" type="button" class="primary" style="flex:1;padding:10px;border-radius:8px;font-size:13px;font-weight:600;">
+            <svg class="icon"><use href="#i-play"/></svg>
+            <span data-i18n="safe.start">Start</span>
+          </button>
+          <button id="safe-btn-stop" type="button" class="secondary" style="flex:1;padding:10px;border-radius:8px;font-size:13px;font-weight:600;" disabled>
+            <svg class="icon"><use href="#i-square"/></svg>
+            <span data-i18n="safe.stop">Stop</span>
+          </button>
+        </div>
+
+        <button id="safe-btn-open" type="button" class="primary" style="width:100%;padding:14px;border-radius:8px;font-size:15px;font-weight:700;margin-bottom:16px;letter-spacing:0.5px;" disabled>
+          <svg class="icon"><use href="#i-log-in"/></svg>
+          <span data-i18n="safe.enterSafe">Enter SAFE™</span>
+        </button>
+
+        <button id="safe-btn-delete" type="button" style="width:100%;padding:10px;border-radius:8px;font-size:13px;font-weight:600;margin-bottom:16px;background:#fee2e2;color:#dc2626;border:1px solid #fca5a5;cursor:pointer;" disabled>
+          <svg class="icon"><use href="#i-trash-2"/></svg>
+          <span data-i18n="safe.deleteEnv">Delete Environment</span>
+        </button>
+
+        <!-- Error display -->
+        <div id="safe-error" style="display:none;text-align:center;padding:12px;margin-top:8px;">
+          <svg class="icon icon-xl" style="color:var(--danger);"><use href="#i-circle-alert"/></svg>
+          <p id="safe-error-msg" style="color:var(--danger);margin:8px 0;font-size:12px;"></p>
+        </div>
+
+        <!-- Debug panel (UAT) -->
+        <div id="safe-debug-panel" class="card" style="padding:12px;margin-top:16px;border:1px dashed var(--muted);">
+          <div style="font-size:11px;font-weight:700;color:var(--muted);margin-bottom:8px;">DEBUG</div>
+          <div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px;">
+            <button id="safe-dbg-status" type="button" style="padding:6px 10px;border-radius:6px;font-size:11px;background:var(--bg-hover);border:1px solid var(--border);cursor:pointer;">Test Status</button>
+            <button id="safe-dbg-start" type="button" style="padding:6px 10px;border-radius:6px;font-size:11px;background:var(--bg-hover);border:1px solid var(--border);cursor:pointer;">Test Start</button>
+            <button id="safe-dbg-url" type="button" style="padding:6px 10px;border-radius:6px;font-size:11px;background:var(--bg-hover);border:1px solid var(--border);cursor:pointer;">Show URL</button>
+            <button id="safe-dbg-open" type="button" style="padding:6px 10px;border-radius:6px;font-size:11px;background:var(--bg-hover);border:1px solid var(--border);cursor:pointer;">Open in Tab</button>
+            <button id="safe-dbg-proxy" type="button" style="padding:6px 10px;border-radius:6px;font-size:11px;background:#fef3c7;color:#92400e;border:1px solid #fcd34d;cursor:pointer;font-weight:600;">Test Proxy</button>
+            <button id="safe-dbg-copy" type="button" style="padding:6px 10px;border-radius:6px;font-size:11px;background:var(--bg-hover);border:1px solid var(--border);cursor:pointer;">📋 Copy</button>
+            <button id="safe-dbg-clear" type="button" style="padding:6px 10px;border-radius:6px;font-size:11px;background:var(--bg-hover);border:1px solid var(--border);cursor:pointer;">Clear</button>
+          </div>
+          <pre id="safe-dbg-log" style="font-size:10px;line-height:1.4;max-height:300px;overflow:auto;background:var(--bg);padding:8px;border-radius:6px;white-space:pre-wrap;word-break:break-all;margin:0;"></pre>
+        </div>
+      </div>
+    </section>
+    <section id="tab-profile" class="tab">
+      <div class="card profile-card">
+        <div class="profile-header">
+          <div class="profile-avatar">
+            <img id="profileAvatarImg" src="/assets/images/avatar.png" alt="Avatar" />
+            <button id="btnProfileEdit" class="avatar-edit-btn" type="button" data-i18n-aria-label="profile.editAvatar"><svg class="icon"><use href="#i-camera"/></svg></button>
+          </div>
+          <div class="profile-main">
+            <div class="profile-nickname">
+              <strong id="profileNickname">……</strong>
+              <button id="btnProfileNickEdit" class="profile-nick-edit-icon" type="button" data-i18n-aria-label="profile.editNickname">
+                <svg class="icon"><use href="#i-pencil"/></svg>
+              </button>
+            </div>
+            <div class="profile-stats">
+              <div class="stat">
+                <div id="statContacts" class="stat-value">0</div>
+                <div class="stat-label" data-i18n="common.friend"></div>
+              </div>
+              <div class="add-friend-wrapper">
+                <button id="btnShareModal" class="profile-share-btn" type="button" data-i18n-aria-label="contacts.addFriend" data-i18n-title="contacts.addFriend">
+                  <svg class="icon"><use href="#i-user-plus"/></svg>
+                </button>
+                <div id="addFriendMenu" class="add-friend-menu" style="display:none">
+                  <button id="btnAddFriendQr" class="add-friend-menu-item" type="button">
+                    <svg class="icon"><use href="#i-qr-code"/></svg>
+                    <span data-i18n="contacts.qrAddFriend"></span>
+                  </button>
+                  <button id="btnAddFriendCode" class="add-friend-menu-item" type="button">
+                    <svg class="icon"><use href="#i-grid-3x3"/></svg>
+                    <span data-i18n="contacts.usePairingCode"></span>
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+          <div id="subscriptionBadge" class="sub-badge" data-tier="none">
+            <div class="sub-badge-icon">
+              <!-- none: shield outline -->
+              <svg class="sub-icon sub-icon--none" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
+              </svg>
+              <!-- basic: shield with check -->
+              <svg class="sub-icon sub-icon--basic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
+                <path d="M9 12l2 2 4-4"/>
+              </svg>
+              <!-- pro: diamond / gem -->
+              <svg class="sub-icon sub-icon--pro" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M6 3h12l4 6-10 13L2 9z"/>
+                <path d="M2 9h20"/>
+                <path d="M12 22L8 9l4-6 4 6z"/>
+              </svg>
+            </div>
+            <span class="sub-badge-label" id="subscriptionLabel" data-i18n="profile.subNone"></span>
+          </div>
+        </div>
+      </div>
+      <div id="securityPanel" class="security-panel"></div>
+    </section>
+  </main>
+
+  <!-- Share Modal -->
+  <div id="shareModal" class="modal share-modal" aria-hidden="true" style="display:none">
+    <div class="modal-backdrop" data-share-close></div>
+    <div class="modal-panel share-modal-panel" role="dialog" aria-modal="true" aria-labelledby="shareModalTitle">
+      <div id="shareFlip" class="share-flip">
+        <div class="share-face share-front">
+          <span id="shareModalTitle" class="sr-only" data-i18n="contacts.addFriend"></span>
+          <header class="share-head">
+            <button type="button" class="share-close" data-share-close-btn data-i18n-aria-label="common.close" aria-label="Close">×</button>
+            <button id="btnShareSwitchScan" class="share-corner-toggle share-corner-toggle--scan" type="button"
+              data-i18n-aria-label="share.switchToScanMode" aria-label="Switch to scan mode">
+              <svg class="icon"><use href="#i-camera"/></svg>
+            </button>
+          </header>
+          <div class="share-body share-body-qr">
+            <div class="share-countdown">
+              <span id="inviteCountdown"></span>
+              <button id="inviteRefreshBtn" class="invite-refresh-btn" type="button" data-i18n-aria-label="share.manualRefreshInvites" aria-label="Refresh friend invite">
+                <svg class="icon"><use href="#i-refresh-cw"/></svg>
+              </button>
+              <!-- inviteConsumeBtn removed: WS auto-consume is sufficient -->
+              <!-- inviteRetryBtn removed: redundant with inviteRefreshBtn -->
+            </div>
+            <div id="inviteQrBox" class="share-qr-box"></div>
+          </div>
+        </div>
+        <div class="share-face share-back">
+          <header class="share-head">
+            <button type="button" class="share-close" data-share-close-btn data-i18n-aria-label="common.close" aria-label="Close">×</button>
+            <button id="btnShareSwitchQr" class="share-corner-toggle share-corner-toggle--qr" type="button"
+              data-i18n-aria-label="share.switchToQRMode" aria-label="Switch to QR mode">
+              <span class="share-corner-qr" aria-hidden="true"></span>
+            </button>
+          </header>
+          <div class="share-body share-body-scan">
+            <video id="inviteScanVideo" class="share-scan-video" muted playsinline></video>
+            <div id="inviteScanStatus" class="share-scan-status"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Pairing Code Modal -->
+  <div id="pairingCodeModal" class="modal pairing-code-modal" aria-hidden="true" style="display:none">
+    <div class="modal-backdrop" data-pairing-close></div>
+    <div class="modal-panel pairing-code-panel" role="dialog" aria-modal="true" aria-labelledby="pairingCodeTitle">
+      <header class="pairing-code-head">
+        <button type="button" class="share-close" data-pairing-close-btn data-i18n-aria-label="common.close" aria-label="Close">×</button>
+        <span id="pairingCodeTitle" class="pairing-code-title" data-i18n="share.pairingCode"></span>
+      </header>
+      <div class="pairing-code-body">
+        <div class="pairing-code-countdown">
+          <span id="pairingCountdown"></span>
+          <button id="pairingRefreshBtn" class="invite-refresh-btn" type="button" data-i18n-aria-label="share.refreshPairingCode" aria-label="Refresh pairing code">
+            <svg class="icon"><use href="#i-refresh-cw"/></svg>
+          </button>
+        </div>
+        <div id="pairingDigits" class="pairing-code-digits">
+          <input type="tel" maxlength="1" inputmode="numeric" pattern="[0-9]" readonly aria-label="Pairing code digit 1" />
+          <input type="tel" maxlength="1" inputmode="numeric" pattern="[0-9]" readonly aria-label="Pairing code digit 2" />
+          <input type="tel" maxlength="1" inputmode="numeric" pattern="[0-9]" readonly aria-label="Pairing code digit 3" />
+          <input type="tel" maxlength="1" inputmode="numeric" pattern="[0-9]" readonly aria-label="Pairing code digit 4" />
+          <input type="tel" maxlength="1" inputmode="numeric" pattern="[0-9]" readonly aria-label="Pairing code digit 5" />
+          <input type="tel" maxlength="1" inputmode="numeric" pattern="[0-9]" readonly aria-label="Pairing code digit 6" />
+        </div>
+        <div id="pairingStatus" class="pairing-code-status"></div>
+        <div class="pairing-code-actions">
+          <button id="btnPairingToggle" class="pairing-toggle-btn" type="button" data-i18n="share.enterPeerPairingCode"></button>
+          <button id="btnPairingConfirm" class="pairing-confirm-btn" type="button" style="display:none" data-i18n="common.confirm"></button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Modal Preview -->
+  <div id="modal" class="modal" aria-hidden="true" style="display:none">
+    <div class="modal-backdrop" id="modalCloseArea"></div>
+    <div class="modal-panel" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
+      <div class="modal-head">
+        <div id="modalTitle" class="modal-title">Preview</div>
+        <div class="modal-actions">
+          <button id="modalClose" class="modal-close" aria-label="Close">×</button>
+        </div>
+      </div>
+      <div id="modalBody" class="modal-body"></div>
+    </div>
+  </div>
+  <div id="customLogoutModal" class="modal custom-logout-modal" aria-hidden="true" style="display:none">
+    <div class="modal-backdrop" id="customLogoutBackdrop"></div>
+    <div class="modal-panel" role="dialog" aria-modal="true" aria-labelledby="customLogoutTitle">
+      <div class="modal-head">
+        <div id="customLogoutTitle" class="modal-title" data-i18n="settings.customLogoutPage"></div>
+        <button id="customLogoutClose" class="modal-close" data-i18n-aria-label="common.close" aria-label="Close">×</button>
+      </div>
+      <div class="modal-body">
+        <div class="custom-logout-body">
+          <p class="custom-logout-desc" data-i18n="settings.customLogoutHint"></p>
+          <label class="custom-logout-field" for="customLogoutInput">
+            <span data-i18n="settings.setUrl"></span>
+            <input type="url" id="customLogoutInput" list="customLogoutOptions" placeholder="https://example.com/logout"
+              inputmode="url" autocomplete="off" spellcheck="false" />
+          </label>
+          <datalist id="customLogoutOptions">
+            <option value="https://google.com"></option>
+            <option value="https://apple.com"></option>
+            <option value="https://www.cloudflare.com"></option>
+            <option value="https://www.mozilla.org"></option>
+            <option value="https://www.wikipedia.org"></option>
+          </datalist>
+          <div id="customLogoutError" class="custom-logout-error" role="status" aria-live="polite"></div>
+          <div class="custom-logout-actions">
+            <button type="button" class="secondary" id="customLogoutCancel" data-i18n="common.cancel"></button>
+            <button type="button" class="primary" id="customLogoutSave" data-i18n="common.save"></button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Ephemeral Auto-Logout Warning Modal -->
+  <div id="ephAutoLogoutWarnModal" class="modal eph-autologout-warn-modal" aria-hidden="true" style="display:none">
+    <div class="modal-backdrop" data-eph-warn-close></div>
+    <div class="modal-panel eph-autologout-warn-panel" role="dialog" aria-modal="true">
+      <div class="modal-head">
+        <div class="modal-title" data-i18n="ephemeral.autoLogoutWarnTitle">Auto-Logout Warning</div>
+        <button class="modal-close" data-eph-warn-close aria-label="Close">&times;</button>
+      </div>
+      <div class="modal-body">
+        <p class="eph-autologout-warn-desc" data-i18n="ephemeral.autoLogoutWarnDesc">You have auto logout on background enabled. Switching to another app to share the link may trigger auto-logout.</p>
+        <div class="eph-autologout-warn-toggle">
+          <div class="settings-text">
+            <strong data-i18n="settings.autoLogoutOnBackground">Auto logout on background</strong>
+          </div>
+          <label class="settings-switch">
+            <input type="checkbox" id="ephAutoLogoutToggle" checked />
+            <span class="switch-track" aria-hidden="true"><span class="switch-thumb"></span></span>
+          </label>
+        </div>
+        <div class="eph-autologout-warn-actions">
+          <button type="button" class="secondary" data-eph-warn-close data-i18n="common.cancel">Cancel</button>
+          <button type="button" class="primary" id="ephAutoLogoutWarnContinue" data-i18n="ephemeral.continueShare">Continue sharing</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Ephemeral Chat Link Modal -->
+  <div id="ephemeralLinkModal" class="modal ephemeral-link-modal" aria-hidden="true" style="display:none">
+    <div class="modal-backdrop" data-eph-close></div>
+    <div class="modal-panel ephemeral-link-panel" role="dialog" aria-modal="true">
+      <div class="modal-head">
+        <div class="modal-title" data-i18n="ephemeral.createLinkTitle">Create Temporary Chat Link</div>
+        <button class="modal-close" data-eph-close aria-label="Close">&times;</button>
+      </div>
+      <div class="modal-body">
+        <p class="ephemeral-link-desc" data-i18n="ephemeral.createLinkDesc">Generate a one-time link for someone without this app to start a temporary encrypted conversation. The link can only be used once and the conversation is limited to 10 minutes.</p>
+        <div id="ephLinkSessionList" class="eph-session-list" style="display:none"></div>
+        <div id="ephLinkError" class="ephemeral-link-error" style="display:none"></div>
+        <div id="ephLinkLoading" class="ephemeral-link-loading">
+          <div class="ephemeral-link-spinner"></div>
+          <span data-i18n="ephemeral.creatingLink">Generating link…</span>
+        </div>
+        <div id="ephLinkResult" class="ephemeral-link-result" style="display:none">
+          <div class="ephemeral-link-url-box">
+            <input id="ephLinkUrl" type="text" readonly class="ephemeral-link-url" />
+            <button id="ephLinkCopy" type="button" class="ephemeral-link-copy" data-i18n="ephemeral.copyBtn">Copy</button>
+            <button id="ephLinkShare" type="button" class="ephemeral-link-share" data-i18n="ephemeral.shareBtn">Share</button>
+          </div>
+          <div id="ephLinkCopied" class="ephemeral-link-copied" style="display:none"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px;margin-right:4px"><circle cx="12" cy="12" r="10" stroke-width="2"/><path d="m9 12 2 2 4-4"/></svg><span data-i18n="ephemeral.copiedToast">Copied to clipboard</span></div>
+          <p class="ephemeral-link-note" data-i18n="ephemeral.linkOneTimeNote">This link can only be used once — do not share it repeatedly</p>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div id="appToast" class="toast" role="button" tabindex="0" aria-live="polite"></div>
+
+  <nav class="navbar">
+    <div class="navbar-pill">
+      <button id="nav-contacts" class="navbtn" data-i18n-aria-label="nav.contacts">
+        <span class="nav-badge" data-tab="contacts"></span>
+        <svg class="icon nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <circle class="ni-head" cx="12" cy="12" r="10" pathLength="1"/>
+          <circle class="ni-face" cx="12" cy="10" r="3" pathLength="1"/>
+          <path class="ni-body" d="M7 20.662V19a2 2 0 0 1 2-2h6a2 2 0 0 1 2 2v1.662" pathLength="1"/>
+        </svg>
+        <span data-i18n="nav.contacts"></span>
+      </button>
+      <button id="nav-messages" class="navbtn" data-i18n-aria-label="nav.messages">
+        <span class="nav-badge" data-tab="messages"></span>
+        <svg class="icon nav-icon nav-icon--msg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path class="ni-bubble" d="M2.992 16.342a2 2 0 0 1 .094 1.167l-1.065 3.29a1 1 0 0 0 1.236 1.168l3.413-.998a2 2 0 0 1 1.099.092 10 10 0 1 0-4.777-4.719" pathLength="1"/>
+        </svg>
+        <span data-i18n="nav.messages"></span>
+      </button>
+      <button id="nav-drive" class="navbtn active" data-i18n-aria-label="nav.encryptedCloud">
+        <span class="nav-badge" data-tab="drive"></span>
+        <svg class="icon nav-icon nav-icon--drive" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path class="ni-cloud" d="M17.5 19H9a7 7 0 1 1 6.71-9h1.79a4.5 4.5 0 1 1 0 9Z" pathLength="1"/>
+          <rect class="ni-lock-body" width="8" height="5" x="8" y="13" rx="1" stroke-width="1.5" pathLength="1"/>
+          <path class="ni-lock-shackle" d="M10 13v-1.5a2 2 0 0 1 4 0V13" stroke-width="1.5" pathLength="1"/>
+        </svg>
+        <span data-i18n="nav.encryptedCloud"></span>
+      </button>
+      <button id="nav-profile" class="navbtn" data-i18n-aria-label="nav.myFiles">
+        <span class="nav-badge" data-tab="profile"></span>
+        <svg class="icon nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <circle class="ni-head" cx="12" cy="7" r="4" pathLength="1"/>
+          <path class="ni-body" d="M19 21v-2a4 4 0 0 0-4-4H9a4 4 0 0 0-4 4v2" pathLength="1"/>
+        </svg>
+        <span data-i18n="nav.myFiles"></span>
+      </button>
+      <button id="nav-apps" class="navbtn" style="display:none" data-i18n-aria-label="nav.apps">
+        <span class="nav-badge" data-tab="apps"></span>
+        <svg class="icon nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <rect x="3" y="3" width="7" height="7" rx="1.5" pathLength="1"/>
+          <rect x="14" y="3" width="7" height="7" rx="1.5" pathLength="1"/>
+          <rect x="3" y="14" width="7" height="7" rx="1.5" pathLength="1"/>
+          <rect x="14" y="14" width="7" height="7" rx="1.5" pathLength="1"/>
+        </svg>
+        <span data-i18n="nav.apps">Apps</span>
+      </button>
+      <button id="nav-safe" class="navbtn" style="display:none" aria-label="SAFE ™">
+        <span class="nav-badge" data-tab="safe"></span>
+        <svg class="icon nav-icon nav-icon--globe" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <circle class="ni-sphere" cx="12" cy="12" r="10" pathLength="1"/>
+          <path class="ni-meridian" d="M12 2a14.5 14.5 0 0 0 0 20 14.5 14.5 0 0 0 0-20" pathLength="1"/>
+          <path class="ni-equator" d="M2 12h20" pathLength="1"/>
+        </svg>
+        <span>SAFE ™</span>
+      </button>
+    </div>
+  </nav>
+
+  <div id="mediaPermissionOverlay" class="media-permission-overlay" aria-hidden="true" style="display:none">
+    <div class="media-permission-card" role="dialog" aria-modal="true" aria-labelledby="mediaPermissionTitle">
+      <svg class="icon icon-2x" aria-hidden="true"><use href="#i-shield"/></svg>
+      <h2 id="mediaPermissionTitle" data-i18n="mediaPermission.enableVoiceCall"></h2>
+      <p data-i18n="mediaPermission.clickBelowToAuth"></p>
+      <ul>
+        <li><svg class="icon"><use href="#i-mic"/></svg><span data-i18n="mediaPermission.micRequiredForE2ee"></span></li>
+        <li><svg class="icon"><use href="#i-volume-2"/></svg><span data-i18n="mediaPermission.unlockAudioPlayback"></span></li>
+      </ul>
+      <div id="mediaPermissionStatus" class="media-permission-status" role="status" aria-live="polite"></div>
+      <p class="media-permission-hints" data-i18n="mediaPermission.safariRetryHint"></p>
+      <div class="media-permission-actions">
+        <button id="mediaPermissionAllowBtn" type="button" class="media-permission-btn">
+          <svg class="icon"><use href="#i-shield-check"/></svg><span id="mediaPermissionAllowLabel" data-i18n="mediaPermission.allowMicrophone"></span>
+        </button>
+        <button id="mediaPermissionDebugBtn" type="button" class="media-permission-skip" style="display:none">Debug</button>
+        <button id="mediaPermissionSkipBtn" type="button" class="media-permission-skip" data-i18n="mediaPermission.later"></button>
+      </div>
+    </div>
+  </div>
+
+  <div id="logoutRedirectCover" class="logout-redirect-cover" aria-hidden="true">
+    <div class="cover-spinner" aria-hidden="true"></div>
+  </div>
+  <script>if (window.__i18nApply) window.__i18nApply();</script>
+  <script>
+    // Route all API requests through the Cloudflare Pages proxy (relative paths).
+    // The [[path]].ts proxy function handles CORS, error wrapping, and path rewriting.
+    // For local dev, override via ?api=https://... query parameter.
+    // Use same-origin so requests go through Pages proxy,
+    // which routes migrated endpoints to Worker and legacy to Node.js.
+    // For local dev, override via ?api=https://... query parameter.
+    window.API_ORIGIN = new URLSearchParams(location.search).get('api') || '';
+    // SAFE Browser Worker URL — set to the deployed safe-worker origin.
+    // Empty string = same origin (Pages Function proxy or Service Binding).
+    window.SAFE_WORKER_URL = new URLSearchParams(location.search).get('safe') || '';
+    (function () {
+      const overlay = document.getElementById('orientationOverlay');
+      const docEl = document.documentElement;
+      const mq = window.matchMedia('(orientation: portrait)');
+      const isMobileLike = () => {
+        const touch = navigator.maxTouchPoints || navigator.msMaxTouchPoints || 0;
+        const shortEdge = Math.min(window.innerWidth, window.innerHeight);
+        const ua = navigator.userAgent || '';
+        const looksMobileUA = /iPhone|iPad|Android|Mobile/i.test(ua);
+        return shortEdge <= 1024 && (touch > 0 || looksMobileUA);
+      };
+      let landscapeAllowed = false;
+      function update() {
+        if (!isMobileLike() || landscapeAllowed) {
+          docEl.classList.remove('orientation-block');
+          if (overlay) overlay.setAttribute('aria-hidden', 'true');
+          return;
+        }
+        const portrait = mq.matches || window.innerHeight >= window.innerWidth;
+        if (portrait) {
+          docEl.classList.remove('orientation-block');
+          if (overlay) overlay.setAttribute('aria-hidden', 'true');
+        } else {
+          docEl.classList.add('orientation-block');
+          if (overlay) overlay.setAttribute('aria-hidden', 'false');
+        }
+      }
+      window.__setLandscapeAllowed = function (allowed) {
+        landscapeAllowed = !!allowed;
+        update();
+        if (!isMobileLike() || !screen.orientation?.lock) return;
+        if (allowed) {
+          screen.orientation.unlock?.();
+        } else {
+          screen.orientation.lock('portrait').catch(() => { });
+        }
+      };
+      if (mq.addEventListener) mq.addEventListener('change', update); else mq.addListener(update);
+      window.addEventListener('orientationchange', update);
+      window.addEventListener('resize', update);
+      update();
+      if (screen.orientation && screen.orientation.lock && isMobileLike()) {
+        screen.orientation.lock('portrait').catch(() => { });
+      }
+    })();
+    (function disablePinchZoom() {
+      const prevent = (evt) => evt.preventDefault();
+      document.addEventListener('gesturestart', prevent, { passive: false });
+      document.addEventListener('gesturechange', prevent, { passive: false });
+      document.addEventListener('gestureend', prevent, { passive: false });
+    })();
+    (function maintainAppHeight() {
+      const docEl = document.documentElement;
+      let baseHeight = window.innerHeight || docEl.clientHeight || 0;
+      const applyHeight = (value) => {
+        if (!value) return;
+        docEl.style.setProperty('--app-height', `${value}px`);
+      };
+      applyHeight(baseHeight);
+      window.addEventListener('resize', () => {
+        const current = window.innerHeight || docEl.clientHeight || 0;
+        if (!current) return;
+        if (current >= baseHeight - 2) {
+          baseHeight = current;
+          applyHeight(baseHeight);
+        }
+      });
+      window.addEventListener('orientationchange', () => {
+        setTimeout(() => {
+          const current = window.innerHeight || docEl.clientHeight || baseHeight;
+          baseHeight = current;
+          applyHeight(baseHeight);
+        }, 300);
+      });
+    })();
+  </script>
+  <script>
+    (function loadAppModule() {
+      const stamp = window.APP_BUILD_AT || window.APP_VERSION || String(Date.now());
+      const versionedSrc = `/app/ui/app-mobile.js?v=${encodeURIComponent(stamp)}`;
+      const script = document.createElement('script');
+      script.type = 'module';
+      script.src = versionedSrc;
+      script.onerror = () => {
+        if (script.dataset.retry) return;
+        script.dataset.retry = '1';
+        const fallback = document.createElement('script');
+        fallback.type = 'module';
+        fallback.src = `/app/ui/app-mobile.js?v=${Date.now()}`;
+        document.body.appendChild(fallback);
+      };
+      document.body.appendChild(script);
+    })();
+  </script>
+</body>
+
+</html>

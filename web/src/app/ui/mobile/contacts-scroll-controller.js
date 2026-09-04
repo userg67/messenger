@@ -1,0 +1,200 @@
+/**
+ * contacts-scroll-controller.js
+ *
+ * Drives progressive hide/show of topbar, navbar, and contact-list-header
+ * based on native scroll position and direction.
+ *
+ * Phase 1 (0 → barTh):   Search bar becomes sticky with glass background
+ * Phase 2 (> barTh):     Topbar/navbar slide out (position-driven, ~60px)
+ *
+ * Restore: direction-driven — as soon as user scrolls back toward top,
+ * bars animate back immediately.
+ *
+ * No position:fixed layout changes — items never resize.
+ */
+
+const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
+
+const BAR_SCROLL_RANGE = 60;     // px of scroll past threshold to fully hide bars
+const RESTORE_SCROLL_DIST = 15;  // cumulative upward px before restoring bars
+const BOUNCE_GUARD_MS = 400;     // ms to suppress restore after hitting scroll bottom
+
+export function createContactsScrollController({
+  scrollEl,
+  headerEl,
+  topbarEl,
+  navbarEl,
+  contentEl
+}) {
+  if (!scrollEl) return null;
+
+  /* ---- measurements ---- */
+  const headerH = headerEl ? headerEl.offsetHeight : 40;
+  const searchWrap = scrollEl.querySelector('.contacts-search-wrap');
+  const searchH = searchWrap ? searchWrap.offsetHeight + 8 : 50; // +margin
+  const barThreshold = headerH + searchH;
+
+  const tabEl = scrollEl.closest('.tab');
+
+  /* ---- state ---- */
+  let prevScrollTop = 0;
+  let barsHidden = false;
+  let rafId = 0;
+  let destroyed = false;
+  let upwardAccum = 0;       // cumulative upward scroll px (for restore trigger)
+  let bounceGuardUntil = 0;  // suppress restore until this timestamp
+
+  /* ---- helpers ---- */
+  function hideBars(progress) {
+    // progress: 0 = fully visible, 1 = fully hidden
+    if (topbarEl) {
+      topbarEl.style.transition = 'none';
+      topbarEl.style.transform = `translateY(${-progress * 100}%)`;
+    }
+    if (navbarEl) {
+      navbarEl.style.transition = 'none';
+      navbarEl.style.transform = `translateY(${progress * 100}%)`;
+    }
+    if (progress >= 1 && !barsHidden) {
+      barsHidden = true;
+      // Reduce scroll bottom padding since navbar is off-screen
+      scrollEl.style.paddingBottom = '28px';
+      // Reclaim topbar/navbar space — pull content up into body padding area
+      if (topbarEl) topbarEl.style.boxShadow = 'none';
+      if (contentEl) {
+        contentEl.style.marginTop = 'calc(-1 * var(--topbar-offset) + env(safe-area-inset-top, 0px))';
+        contentEl.style.height = 'calc(var(--app-height) - env(safe-area-inset-top, 0px))';
+        contentEl.style.minHeight = contentEl.style.height;
+      }
+      if (tabEl) tabEl.style.paddingBottom = '0';
+    }
+  }
+
+  function showBars() {
+    if (!barsHidden) return;
+    barsHidden = false;
+    // Restore scroll padding for navbar
+    scrollEl.style.paddingBottom = '';
+    // Restore topbar/navbar space with matching transition
+    if (topbarEl) {
+      topbarEl.style.boxShadow = '';
+      topbarEl.style.transition = 'transform 220ms ease-out';
+      topbarEl.style.transform = '';
+    }
+    if (navbarEl) {
+      navbarEl.style.transition = 'transform 220ms ease-out';
+      navbarEl.style.transform = '';
+    }
+    if (contentEl) {
+      contentEl.style.transition = 'margin-top 220ms ease-out, height 220ms ease-out, min-height 220ms ease-out';
+      contentEl.style.marginTop = '';
+      contentEl.style.height = '';
+      contentEl.style.minHeight = '';
+    }
+    if (tabEl) tabEl.style.paddingBottom = '';
+  }
+
+  /* ---- main scroll handler ---- */
+  function onScroll() {
+    if (destroyed) return;
+    if (rafId) return; // already scheduled
+    rafId = requestAnimationFrame(() => {
+      rafId = 0;
+      if (destroyed) return;
+      const scrollTop = scrollEl.scrollTop;
+      const delta = scrollTop - prevScrollTop;
+
+      // Search bar: sticky glass background when header scrolled out
+      if (searchWrap) {
+        if (scrollTop >= headerH) {
+          searchWrap.classList.add('search-floating');
+        } else {
+          searchWrap.classList.remove('search-floating');
+        }
+      }
+
+      // Bottom bounce guard: suppress restore near maxScroll
+      const maxScroll = scrollEl.scrollHeight - scrollEl.clientHeight;
+      if (maxScroll > 0 && scrollTop >= maxScroll - 2) {
+        bounceGuardUntil = performance.now() + BOUNCE_GUARD_MS;
+      }
+
+      // Cumulative upward tracking (filters out small bounce deltas)
+      if (delta < 0) {
+        upwardAccum += -delta;
+      } else if (delta > 0) {
+        upwardAccum = 0;
+      }
+
+      // Bar hide/show
+      // Guard: skip bar hiding entirely when there isn't enough scroll
+      // content to fully hide bars — prevents partial-transform stuck state
+      // when there are few contacts.
+      const maxScrollForBars = scrollEl.scrollHeight - scrollEl.clientHeight;
+      const canFullyHide = maxScrollForBars > barThreshold + BAR_SCROLL_RANGE;
+
+      if (canFullyHide && scrollTop > barThreshold) {
+        if (barsHidden && upwardAccum >= RESTORE_SCROLL_DIST
+            && performance.now() > bounceGuardUntil) {
+          // direction-driven restore (requires sustained upward scroll)
+          showBars();
+          upwardAccum = 0;
+        } else if (!barsHidden) {
+          // position-driven hide/reveal — tracks scroll in both directions
+          // so bars follow the finger on the way back up, not just down
+          const progress = clamp((scrollTop - barThreshold) / BAR_SCROLL_RANGE, 0, 1);
+          hideBars(progress);
+        }
+      } else {
+        // scrolled back above threshold — bars must be visible
+        if (barsHidden) {
+          showBars();
+        }
+        // Clear any leftover transform from partial hide
+        if (topbarEl && topbarEl.style.transform) {
+          topbarEl.style.transition = 'transform 220ms ease-out';
+          topbarEl.style.transform = '';
+        }
+        if (navbarEl && navbarEl.style.transform) {
+          navbarEl.style.transition = 'transform 220ms ease-out';
+          navbarEl.style.transform = '';
+        }
+      }
+
+      prevScrollTop = scrollTop;
+    });
+  }
+
+  /* ---- lifecycle ---- */
+  scrollEl.addEventListener('scroll', onScroll, { passive: true });
+
+  function restoreBars() {
+    if (rafId) { cancelAnimationFrame(rafId); rafId = 0; }
+    if (barsHidden) showBars();
+    // Force-clear transforms in case of partial state
+    if (topbarEl) { topbarEl.style.transition = ''; topbarEl.style.transform = ''; topbarEl.style.boxShadow = ''; }
+    if (navbarEl) { navbarEl.style.transition = ''; navbarEl.style.transform = ''; }
+    if (contentEl) { contentEl.style.transition = ''; contentEl.style.marginTop = ''; contentEl.style.height = ''; contentEl.style.minHeight = ''; }
+    if (tabEl) tabEl.style.paddingBottom = '';
+    scrollEl.style.paddingBottom = '';
+    if (searchWrap) searchWrap.classList.remove('search-floating');
+    if (headerEl) { headerEl.style.opacity = ''; headerEl.style.visibility = ''; }
+    barsHidden = false;
+    upwardAccum = 0;
+    prevScrollTop = scrollEl.scrollTop;
+  }
+
+  function isBarsHidden() {
+    return barsHidden;
+  }
+
+  function destroy() {
+    destroyed = true;
+    if (rafId) { cancelAnimationFrame(rafId); rafId = 0; }
+    scrollEl.removeEventListener('scroll', onScroll);
+    restoreBars();
+    if (headerEl) { headerEl.style.opacity = ''; headerEl.style.visibility = ''; }
+  }
+
+  return { restoreBars, isBarsHidden, destroy };
+}

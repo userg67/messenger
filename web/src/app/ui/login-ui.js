@@ -1,0 +1,1408 @@
+// /app/ui/login-ui.js
+// Login page binder: SDM Exchange → Unlock (argon2id) → ensureKeysAfterUnlock → redirect to /pages/app.html
+// This module is intentionally self-contained for the login page; it reuses core modules and minimal crypto helpers.
+
+// Removed import of fetchJSON, jsonReq from ../core/http.js
+import { log, setLogSink } from '../core/log.js';
+import { DEBUG } from './mobile/debug-flags.js';
+import { initVersionInfoButton } from './version-info.js';
+import {
+  getSession, setSession,
+  getHasMK, setHasMK,
+  getWrappedMK, setWrappedMK,
+  getMkRaw, setMkRaw,
+  getAccountToken, setAccountToken,
+  getAccountDigest, setAccountDigest,
+  getDevicePriv, ensureDeviceId,
+  resetAll, clearSecrets,
+  setOpaqueServerId,
+  setBrandKey, setBrandName, setBrandLogo
+} from '../core/store.js';
+import { exchangeSDM, unlockAndInit } from '../features/login-flow.js';
+import { exchangeFromURLIfPresent, exchangeWithParams, parseSdmParams } from '../features/sdm.js';
+import {
+  summarizeContactSecretsPayload,
+  getContactSecretsStorageKeys,
+  getContactSecretsLatestKeys,
+  getContactSecretsMetaKeys,
+  getContactSecretsChecksumKeys,
+  getLegacyContactSecretsStorageKeys,
+  getLegacyContactSecretsLatestKeys,
+  getLegacyContactSecretsMetaKeys,
+  getLegacyContactSecretsChecksumKeys
+} from '../core/contact-secrets.js';
+import { triggerContactSecretsBackup, hydrateContactSecretsFromBackup } from '../features/contact-backup.js';
+import { IDENTICON_PALETTE, buildIdenticonSvg } from '../lib/identicon.js';
+import { initProfileDefaultsOnce } from '../features/profile.js';
+import { loadArgon2 } from '../crypto/kdf.js';
+import { generateInitialBundle } from '../crypto/prekeys.js';
+import { generateSimExchange, upsertSimTag, setSimConfig } from '../../libs/ntag424-sim.js';
+import { isIosVersionTooOld } from './mobile/browser-detection.js';
+import { applyBrand } from '../core/brand-apply.js';
+import { brandLookup } from '../api/auth.js';
+import { initI18n, t, applyDOMTranslations } from '/locales/index.js';
+
+// --- i18n: load language pack early (non-blocking) ---
+const i18nReady = initI18n().catch(err => {
+  console.warn('[i18n] Init failed, using fallback keys:', err);
+});
+
+function summarizeMkForLog(mkRaw) {
+  const summary = { mkLen: mkRaw instanceof Uint8Array ? mkRaw.length : 0, mkHash12: null };
+  if (!(mkRaw instanceof Uint8Array) || typeof crypto === 'undefined' || !crypto.subtle?.digest) return Promise.resolve(summary);
+  return crypto.subtle.digest('SHA-256', mkRaw).then((digest) => {
+    const hex = Array.from(new Uint8Array(digest)).map((b) => b.toString(16).padStart(2, '0')).join('');
+    summary.mkHash12 = hex.slice(0, 12);
+    return summary;
+  }).catch(() => summary);
+}
+
+let mkSetTraceLogged = false;
+async function emitMkSetTrace(sourceTag, mkRaw) {
+  if (mkSetTraceLogged) return;
+  mkSetTraceLogged = true;
+  try {
+    const { mkLen, mkHash12 } = await summarizeMkForLog(mkRaw);
+    log({
+      mkSetTrace: {
+        sourceTag,
+        mkLen,
+        mkHash12,
+        accountDigestSuffix4: (getAccountDigest() || '').slice(-4) || null,
+        deviceIdSuffix4: (ensureDeviceId?.() || '').slice(-4) || null
+      }
+    });
+  } catch { }
+}
+
+let identityTraceCount = 0;
+async function emitIdentityTrace(sourceTag, extra = {}) {
+  if (!DEBUG.identityTrace || identityTraceCount >= 5) return;
+  identityTraceCount += 1;
+  try {
+    const { mkHash12 } = await summarizeMkForLog(getMkRaw());
+    const accountDigest = getAccountDigest() || null;
+    const uidHex = null; // UID removed from store, using accountDigest instead
+    let deviceId = null;
+    try { deviceId = ensureDeviceId(); } catch { deviceId = null; }
+    log({
+      identityTrace: {
+        sourceTag,
+        accountDigestSuffix4: accountDigest ? accountDigest.slice(-4) : null,
+        uidHexSuffix4: uidHex ? uidHex.slice(-4) : null,
+        deviceIdSuffix4: deviceId ? deviceId.slice(-4) : null,
+        mkHash12: mkHash12 || null,
+        ...extra
+      }
+    });
+  } catch { }
+}
+
+// ---- UI elements ----
+const $ = (sel) => document.querySelector(sel);
+const out = $('#out');
+const modalEl = document.getElementById('loginModal');
+const modalBody = document.getElementById('loginModalBody');
+const modalClose = document.getElementById('loginModalClose');
+const modalBackdrop = document.getElementById('loginModalBackdrop');
+const loginErrorEl = document.getElementById('loginError');
+const loginErrorText = document.getElementById('loginErrorText');
+const loginErrorClose = document.getElementById('loginErrorClose');
+const welcomeModal = document.getElementById('welcomeModal');
+const welcomeNextBtn = document.getElementById('welcomeNext');
+const welcomeCloseBtn = document.getElementById('welcomeClose');
+const loginShellEl = document.querySelector('.login-shell');
+const uidIdenticonEl = document.getElementById('uidIdenticon');
+const uidCardEl = document.getElementById('uidCard');
+const passwordAreaEl = document.getElementById('passwordArea');
+
+initVersionInfoButton({ buttonId: 'versionInfoBtnLogin', popupId: 'versionInfoPopupLogin' });
+
+// Block login on iOS < 17.1 (ManagedMediaSource not available)
+if (isIosVersionTooOld()) {
+  const shell = document.querySelector('.login-shell');
+  if (shell) shell.style.display = 'none';
+  const blocker = document.createElement('div');
+  blocker.style.cssText = 'position:fixed;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;background:#0a0a0a;color:#e0e0e0;padding:2rem;text-align:center;z-index:99999;font-family:-apple-system,system-ui,sans-serif;';
+  blocker.innerHTML = '<div style="font-size:2.5rem;margin-bottom:1rem;">&#9888;&#65039;</div>'
+    + `<h2 style="margin:0 0 0.75rem;font-size:1.25rem;color:#fff;">${t('auth.iosVersionTooOld')}</h2>`
+    + '<p style="margin:0;font-size:0.95rem;line-height:1.6;max-width:320px;color:#aaa;">'
+    + `${t('auth.iosVersionRequired', { version: '17.1' })}`
+    + `<br><br>${t('auth.iosUpdateInstructions')}</p>`;
+  document.body.appendChild(blocker);
+}
+
+let pendingLogoutNotice = null;
+
+function isAutomationEnv() {
+  try {
+    if (typeof navigator !== 'undefined' && navigator.webdriver) return true;
+  } catch { }
+  return false;
+}
+(function captureLogoutNotice() {
+  try {
+    pendingLogoutNotice = sessionStorage.getItem('app:lastLogoutReason');
+  } catch { }
+})();
+
+(function clearStorageOnLogin() {
+  const logoutReason = pendingLogoutNotice;
+  (async () => {
+    try {
+      if (typeof caches !== 'undefined' && typeof caches.keys === 'function') {
+        const keys = await caches.keys();
+        await Promise.all(keys.map((key) => caches.delete(key)));
+      }
+    } catch (err) {
+      log({ loginCacheClearError: err?.message || err });
+    }
+    try {
+      if (typeof indexedDB !== 'undefined' && typeof indexedDB.databases === 'function') {
+        const dbs = await indexedDB.databases();
+        await Promise.all(
+          dbs
+            .map((db) => db?.name)
+            .filter((name) => typeof name === 'string' && name.length)
+            .map((name) => new Promise((resolve) => {
+              try {
+                const req = indexedDB.deleteDatabase(name);
+                req.onsuccess = () => resolve();
+                req.onblocked = () => resolve();
+                req.onerror = () => resolve();
+              } catch {
+                resolve();
+              }
+            }))
+        );
+      }
+    } catch (err) {
+      log({ loginIndexedDbClearError: err?.message || err });
+    }
+    try { localStorage.clear?.(); } catch (err) { log({ loginLocalClearError: err?.message || err }); }
+    try { sessionStorage.clear?.(); } catch (err) { log({ loginSessionClearError: err?.message || err }); }
+    if (logoutReason) {
+      try { sessionStorage.setItem('app:lastLogoutReason', logoutReason); } catch { }
+    }
+  })();
+})();
+
+setLogSink((line) => {
+  if (out) out.textContent = line;
+  // Suppress error modal while login is in progress — non-fatal diagnostic
+  // logs (e.g. contactRestoreError, deviceIdStorageError) would otherwise
+  // trigger the fallback "unknown error" modal. Real errors always call
+  // hideLoading() and set loginInProgress=false before calling log().
+  if (!loginInProgress && shouldShowModal(line)) showModalMessage(line);
+});
+
+let identiconRenderSeq = 0;
+
+let passwordAreaVisible = false;
+
+function setPasswordAreaVisible(visible) {
+  passwordAreaVisible = !!visible;
+  if (loginShellEl) loginShellEl.classList.toggle('login-verified', passwordAreaVisible);
+  if (!passwordAreaVisible) {
+    if (pwdEl) pwdEl.value = '';
+    if (pwdConfirmEl) pwdConfirmEl.value = '';
+  }
+}
+
+async function renderIdenticon(uid, { pending = false } = {}) {
+  if (!uidIdenticonEl) return;
+  if (pending || !uid) {
+    uidIdenticonEl.classList.add('pending');
+    const blocks = Array.from({ length: 25 }).map((_, i) => `<div style="--i:${i};"></div>`).join('');
+    uidIdenticonEl.innerHTML = `<div class="mosaic">${blocks}</div>`;
+    return;
+  }
+  uidIdenticonEl.classList.remove('pending');
+  const seq = ++identiconRenderSeq;
+  try {
+    const svg = await buildIdenticonSvg(uid);
+    if (seq !== identiconRenderSeq) return;
+    uidIdenticonEl.innerHTML = svg;
+  } catch (err) {
+    uidIdenticonEl.classList.add('pending');
+    log({ identiconError: String(err?.message || err) });
+  }
+}
+
+function getContactSecretKeyOptionsForLogin(uidOverride) {
+  return {
+    accountDigest: getAccountDigest()
+  };
+}
+
+function readContactSnapshotFrom(storage, keys = []) {
+  if (!storage || !keys?.length) return null;
+  for (const key of keys) {
+    try {
+      const value = storage.getItem(key);
+      if (value) return { key, value };
+    } catch { }
+  }
+  return null;
+}
+
+function purgeLoginStorage() {
+  const seedCache = typeof window !== 'undefined' && window.__LOGIN_SEED_LOCALSTORAGE && typeof window.__LOGIN_SEED_LOCALSTORAGE === 'object'
+    ? { ...window.__LOGIN_SEED_LOCALSTORAGE }
+    : null;
+  let seeds = null;
+  const keyOptions = getContactSecretKeyOptionsForLogin();
+  const storageKeys = Array.from(new Set([
+    ...getContactSecretsStorageKeys(keyOptions),
+    ...getContactSecretsStorageKeys({})
+  ]));
+  const latestKeys = Array.from(new Set([
+    ...getContactSecretsLatestKeys(keyOptions),
+    ...getContactSecretsLatestKeys({})
+  ]));
+  const legacyStorageKeys = Array.from(new Set([
+    ...getLegacyContactSecretsStorageKeys(keyOptions),
+    ...getLegacyContactSecretsStorageKeys({})
+  ]));
+  const legacyLatestKeys = Array.from(new Set([
+    ...getLegacyContactSecretsLatestKeys(keyOptions),
+    ...getLegacyContactSecretsLatestKeys({})
+  ]));
+  const legacyMetaKeys = Array.from(new Set([
+    ...getLegacyContactSecretsMetaKeys(keyOptions),
+    ...getLegacyContactSecretsMetaKeys({})
+  ]));
+  const legacyChecksumKeys = Array.from(new Set([
+    ...getLegacyContactSecretsChecksumKeys(keyOptions),
+    ...getLegacyContactSecretsChecksumKeys({})
+  ]));
+  const candidates = [];
+  const addCandidate = (store, keys, source, isLegacy = false) => {
+    const record = readContactSnapshotFrom(store, keys);
+    if (record?.value) {
+      candidates.push({
+        value: record.value,
+        source: `${source}:${record.key}`,
+        isLegacy
+      });
+    }
+  };
+  const addSeedCandidate = (cache, keys, source, isLegacy = false) => {
+    if (!cache) return;
+    for (const key of keys) {
+      if (typeof cache[key] === 'string') {
+        candidates.push({ value: cache[key], source, isLegacy });
+        break;
+      }
+    }
+  };
+  try {
+    const storage = localStorage;
+    addCandidate(storage, storageKeys, 'local', false);
+    addCandidate(storage, latestKeys, 'local-latest', false);
+    addCandidate(storage, legacyStorageKeys, 'legacy-local', true);
+    addCandidate(storage, legacyLatestKeys, 'legacy-local-latest', true);
+    addSeedCandidate(seedCache, storageKeys, 'seed-v2', false);
+    addSeedCandidate(seedCache, legacyStorageKeys, 'seed-v1', true);
+    let handoffChecksum = null;
+    if (typeof sessionStorage !== 'undefined') {
+      addCandidate(sessionStorage, storageKeys, 'session', false);
+      addCandidate(sessionStorage, latestKeys, 'session-latest', false);
+      addCandidate(sessionStorage, legacyStorageKeys, 'legacy-session', true);
+      addCandidate(sessionStorage, legacyLatestKeys, 'legacy-session-latest', true);
+      try {
+        const checksumRaw = readContactSnapshotFrom(sessionStorage, legacyChecksumKeys)?.value || null;
+        if (checksumRaw) handoffChecksum = JSON.parse(checksumRaw);
+      } catch { }
+      if (handoffChecksum) {
+        log({ contactSecretsHandoffChecksum: handoffChecksum });
+      }
+      [...legacyMetaKeys, ...legacyChecksumKeys, ...legacyStorageKeys, ...legacyLatestKeys].forEach((key) => {
+        try { sessionStorage.removeItem(key); } catch { }
+      });
+    }
+    const best = candidates.reduce((prev, cand) => {
+      const len = typeof cand.value === 'string' ? cand.value.length : 0;
+      if (!len) return prev;
+      if (!prev) return { ...cand, len };
+      if (len > prev.len) return { ...cand, len };
+      if (len === prev.len && prev.isLegacy && !cand.isLegacy) return { ...cand, len };
+      return prev;
+    }, null);
+    if (best?.value) {
+      seeds = {};
+      storageKeys.forEach((key) => { seeds[key] = best.value; });
+      latestKeys.forEach((key) => { seeds[key] = best.value; });
+      seeds.__CONTACT_SECRET_SOURCE = best.source;
+      seeds.__CONTACT_SECRET_VERSION = best.isLegacy ? 'migrated-v1' : 'v2';
+      const summary = summarizeContactSecretsPayload(best.value);
+      log({ contactSecretsSeedPrepared: summary });
+      if (isAutomationEnv()) {
+        log({ contactSecretsSeedSource: best.source, contactSecretsSeedBytes: best.value.length });
+      }
+    }
+    storage.clear();
+    if (seeds) {
+      for (const [key, value] of Object.entries(seeds)) {
+        if (key.startsWith('__')) continue;
+        try { storage.setItem(key, value); } catch (err) { log({ loginStorageSeedWriteError: err?.message || err, key }); }
+      }
+      const primarySeed = Object.entries(seeds).find(([key]) => !key.startsWith('__'));
+      if (primarySeed && typeof primarySeed[1] === 'string') {
+        log({ contactSecretsSeedApplied: summarizeContactSecretsPayload(primarySeed[1]) });
+      }
+    }
+  } catch (err) {
+    log({ loginStorageClearLocalError: err?.message || err });
+  }
+  try {
+    resetAll();
+    clearSecrets();
+  } catch (err) {
+    log({ loginStoreResetError: err?.message || err });
+  }
+  try {
+    sessionStorage.removeItem('wrapped_dev');
+    const keyOptions = getContactSecretKeyOptionsForLogin();
+    const keysToRemove = new Set([
+      ...getContactSecretsStorageKeys(keyOptions),
+      ...getContactSecretsStorageKeys({}),
+      ...getContactSecretsLatestKeys(keyOptions),
+      ...getContactSecretsLatestKeys({}),
+      ...getContactSecretsMetaKeys(keyOptions),
+      ...getContactSecretsMetaKeys({}),
+      ...getContactSecretsChecksumKeys(keyOptions),
+      ...getContactSecretsChecksumKeys({}),
+      ...getLegacyContactSecretsStorageKeys(keyOptions),
+      ...getLegacyContactSecretsStorageKeys({}),
+      ...getLegacyContactSecretsLatestKeys(keyOptions),
+      ...getLegacyContactSecretsLatestKeys({}),
+      ...getLegacyContactSecretsMetaKeys(keyOptions),
+      ...getLegacyContactSecretsMetaKeys({}),
+      ...getLegacyContactSecretsChecksumKeys(keyOptions),
+      ...getLegacyContactSecretsChecksumKeys({})
+    ]);
+    keysToRemove.forEach((key) => {
+      try { sessionStorage.removeItem(key); } catch { }
+    });
+  } catch { }
+  if (typeof window !== 'undefined' && window.__LOGIN_SEED_LOCALSTORAGE) {
+    try { delete window.__LOGIN_SEED_LOCALSTORAGE; } catch { }
+  }
+  if (typeof window !== 'undefined' && window.caches?.keys) {
+    caches.keys()
+      .then((keys) => Promise.all(keys.map((key) => caches.delete(key))))
+      .catch((err) => log({ loginCacheClearError: err?.message || err }));
+  }
+  if (typeof indexedDB !== 'undefined' && typeof indexedDB.databases === 'function') {
+    indexedDB.databases()
+      .then((dbs) => Promise.all(
+        dbs
+          .map((db) => db?.name)
+          .filter((name) => typeof name === 'string' && name.length)
+          .map((name) => new Promise((resolve) => {
+            const req = indexedDB.deleteDatabase(name);
+            req.onsuccess = () => resolve();
+            req.onblocked = () => resolve();
+            req.onerror = () => {
+              log({ loginIndexedDbDeleteError: req.error?.message || req.error || name, name });
+              resolve();
+            };
+          }))
+      ))
+      .catch((err) => log({ loginIndexedDbClearError: err?.message || err }));
+  }
+}
+
+purgeLoginStorage();
+if (pendingLogoutNotice) {
+  log(pendingLogoutNotice);
+  try { sessionStorage.removeItem('app:lastLogoutReason'); } catch { }
+  pendingLogoutNotice = null;
+}
+
+const uidEl = $('#uidHex');
+const macEl = $('#sdmMac');
+const ctrEl = $('#sdmCtr');
+const nonceEl = $('#nonce');
+const btnSdmExchangeEl = document.getElementById('btnSdmExchange');
+const sessionView = $('#sessionView');
+const pwdEl = $('#pwd');
+const unlockBtn = $('#btnUnlock');
+const passwordWrapper = document.getElementById('passwordWrapper');
+const confirmWrapper = document.getElementById('confirmWrapper');
+const pwdConfirmEl = document.getElementById('pwdConfirm');
+const passwordToggles = document.querySelectorAll('.password-toggle');
+export const AUDIO_PERMISSION_KEY = 'audio-permission';
+
+let loginInProgress = false;
+let newAccount = false;
+let welcomeAcknowledged = false;
+
+setPasswordAreaVisible(false);
+
+if (pwdEl) {
+  try {
+    const rand = Math.random().toString(36).slice(2);
+    pwdEl.name = `pw_${Date.now()}_${rand}`;
+    pwdEl.setAttribute('autocomplete', 'off');
+    pwdEl.setAttribute('data-keep-autocomplete-off', 'true');
+  } catch { }
+}
+if (pwdConfirmEl) {
+  try {
+    const rand = Math.random().toString(36).slice(2);
+    pwdConfirmEl.name = `pw_c_${Date.now()}_${rand}`;
+    pwdConfirmEl.setAttribute('autocomplete', 'off');
+  } catch { }
+}
+applyAccountMode();
+if (getSession() || getHasMK() || getWrappedMK()) {
+  markVerifiedUI();
+}
+const loginStage = document.getElementById('loginStage');
+const transitionBar = document.getElementById('loginTransitionBar');
+const transitionLabel = document.getElementById('loginTransitionLabel');
+
+// --- Unified white loading modal (progress bar + label) ---
+// Login phase covers 0%→70%, app.html continues from 70%→100%.
+// New-account path: opaque → wrap-mk → mk-store → generate-bundle → prekeys-publish
+//   → wrap-device → devkeys-store → nickname-init → avatar-init
+// Existing-account path: opaque → wrap-mk → mk-store → devkeys-fetch → prekeys-sync
+//   → contact-restore
+// Both paths span 0%→70% since flow-specific steps occupy non-overlapping ranges.
+const STEP_PROGRESS = {
+  // Shared steps (0% → 20%)
+  'opaque':          { start: 2,  done: 10, i18nKey: 'loginStages.authenticating' },
+  'wrap-mk':         { start: 10, done: 16, i18nKey: 'loginStages.encryptingMasterKey' },
+  'mk-store':        { start: 16, done: 20, i18nKey: 'loginStages.securingKeyVault' },
+  // New-account only (20% → 70%)
+  'generate-bundle': { start: 20, done: 30, i18nKey: 'loginStages.generatingCipherKeys' },
+  'prekeys-publish': { start: 30, done: 40, i18nKey: 'loginStages.publishingPrekeys' },
+  'wrap-device':     { start: 40, done: 48, i18nKey: 'loginStages.wrappingDeviceKeys' },
+  'devkeys-store':   { start: 48, done: 54, i18nKey: 'loginStages.storingDeviceBackup' },
+  'nickname-init':   { start: 54, done: 62, i18nKey: 'loginStages.settingIdentity' },
+  'avatar-init':     { start: 62, done: 70, i18nKey: 'loginStages.configuringProfile' },
+  // Existing-account only (20% → 70%)
+  'devkeys-fetch':   { start: 20, done: 32, i18nKey: 'loginStages.fetchingDeviceKeys' },
+  'prekeys-sync':    { start: 32, done: 50, i18nKey: 'loginStages.syncingCipherKeys' },
+  'contact-restore': { start: 50, done: 70, i18nKey: 'loginStages.restoringContacts' },
+};
+let currentProgress = 0;
+let fillRAF = null;
+let fillTarget = 0;
+let fillLast = 0;
+const FILL_SPEED = 10; // % per second — smooth continuous fill
+
+function setBarWidth(pct) {
+  if (transitionBar) transitionBar.style.width = pct + '%';
+}
+
+function startSlowFill(target) {
+  fillTarget = target;
+  if (fillRAF) return;               // already animating
+  fillLast = performance.now();
+  function tick(now) {
+    const dt = (now - fillLast) / 1000;
+    fillLast = now;
+    if (currentProgress < fillTarget - 0.3) {
+      currentProgress = Math.min(currentProgress + FILL_SPEED * dt, fillTarget - 0.3);
+      setBarWidth(currentProgress);
+      fillRAF = requestAnimationFrame(tick);
+    } else {
+      fillRAF = null;
+    }
+  }
+  fillRAF = requestAnimationFrame(tick);
+}
+
+function stopSlowFill() {
+  if (fillRAF) { cancelAnimationFrame(fillRAF); fillRAF = null; }
+}
+
+function setTransitionProgress(pct, label) {
+  stopSlowFill();
+  if (pct > currentProgress) currentProgress = pct;
+  setBarWidth(currentProgress);
+  if (transitionLabel && label) transitionLabel.textContent = label;
+}
+
+// Step sequences for looking up the next step after 'success'
+const STEP_SEQUENCES = [
+  ['opaque','wrap-mk','mk-store','generate-bundle','prekeys-publish','wrap-device','devkeys-store','nickname-init','avatar-init'],
+  ['opaque','wrap-mk','mk-store','devkeys-fetch','prekeys-sync','contact-restore']
+];
+
+function getNextStepTarget(currentStep) {
+  for (const seq of STEP_SEQUENCES) {
+    const idx = seq.indexOf(currentStep);
+    if (idx >= 0 && idx < seq.length - 1) {
+      return STEP_PROGRESS[seq[idx + 1]]?.done;
+    }
+  }
+  return null;
+}
+
+function updateBootstrapStep(step, status) {
+  const def = STEP_PROGRESS[step];
+  if (!def) return;
+  if (status === 'start') {
+    // Snap to start value, update label, then slowly fill toward done
+    stopSlowFill();
+    if (def.start > currentProgress) currentProgress = def.start;
+    setBarWidth(currentProgress);
+    if (transitionLabel) transitionLabel.textContent = def.i18nKey ? t(def.i18nKey) : '';
+    startSlowFill(def.done);
+  } else if (status === 'success' || status === 'skip' || status === 'info') {
+    // Snap to done value, then bridge-fill toward next step's target
+    stopSlowFill();
+    if (def.done > currentProgress) currentProgress = def.done;
+    setBarWidth(currentProgress);
+    const nextTarget = getNextStepTarget(step);
+    if (nextTarget && currentProgress < nextTarget) {
+      startSlowFill(nextTarget);
+    }
+  }
+  // error status: keep current progress/label — hideLoading will dismiss modal
+}
+
+function resetBootstrapProgress() { currentProgress = 0; }
+function initBootstrapProgress() { /* no-op: progress bar driven by updateBootstrapStep */ }
+
+function showLoading(message) {
+  stopSlowFill();
+  currentProgress = 0;
+  setBarWidth(0);
+  if (transitionLabel) transitionLabel.textContent = message || 'INITIALIZING...';
+  if (unlockBtn) unlockBtn.disabled = true;
+  // Slide panel up, reveal background stage
+  if (loginShellEl) {
+    loginShellEl.classList.remove('panel-enter');
+    loginShellEl.classList.add('panel-exit');
+  }
+  if (loginStage) loginStage.classList.add('active');
+  // Start sci-fi canvas immediately; delay brand decode by 0.45s
+  if (typeof window.__tmCanvasStart === 'function') window.__tmCanvasStart();
+  setTimeout(() => {
+    if (typeof window.__tmScrambleStart === 'function') window.__tmScrambleStart();
+  }, 750);
+}
+
+function updateLoading(message) {
+  if (transitionLabel && message) transitionLabel.textContent = message;
+}
+
+function hideLoading() {
+  stopSlowFill();
+  // Stop sci-fi canvas + text scramble
+  if (typeof window.__tmCanvasStop === 'function') window.__tmCanvasStop();
+  if (typeof window.__tmScrambleStop === 'function') window.__tmScrambleStop();
+  // Fade out stage, slide panel back in from below
+  if (loginStage) loginStage.classList.remove('active');
+  if (loginShellEl) {
+    loginShellEl.classList.remove('panel-exit');
+    loginShellEl.classList.add('panel-enter');
+    loginShellEl.addEventListener('animationend', function handler() {
+      loginShellEl.classList.remove('panel-enter');
+      loginShellEl.removeEventListener('animationend', handler);
+    });
+  }
+  currentProgress = 0;
+  setBarWidth(0);
+  if (unlockBtn) unlockBtn.disabled = false;
+}
+
+function showWelcomeModal() {
+  if (!welcomeModal) return;
+  welcomeModal.classList.remove('hidden');
+  welcomeModal.setAttribute('aria-hidden', 'false');
+  const focusTarget = welcomeNextBtn || welcomeCloseBtn;
+  if (focusTarget && typeof focusTarget.focus === 'function') {
+    try {
+      focusTarget.focus({ preventScroll: true });
+    } catch {
+      focusTarget.focus();
+    }
+  }
+}
+
+function hideWelcomeModal() {
+  if (!welcomeModal) return;
+  welcomeModal.classList.add('hidden');
+  welcomeModal.setAttribute('aria-hidden', 'true');
+  if (newAccount) {
+    welcomeAcknowledged = true;
+    if (confirmWrapper) confirmWrapper.classList.remove('hidden');
+    if (unlockBtn) unlockBtn.disabled = false;
+  }
+}
+
+function applyAccountMode() {
+  if (newAccount) {
+    if (passwordWrapper) {
+      const label = passwordWrapper.querySelector('label');
+      if (label) label.textContent = t('auth.setLoginPassword');
+    }
+    if (confirmWrapper) {
+      if (welcomeAcknowledged) confirmWrapper.classList.remove('hidden');
+      else confirmWrapper.classList.add('hidden');
+    }
+    if (unlockBtn) {
+      unlockBtn.textContent = t('auth.login');
+      unlockBtn.disabled = !welcomeAcknowledged;
+    }
+    if (!welcomeAcknowledged) showWelcomeModal();
+  } else {
+    if (passwordWrapper) {
+      const label = passwordWrapper.querySelector('label');
+      if (label) label.textContent = t('auth.loginPassword');
+    }
+    if (confirmWrapper) {
+      confirmWrapper.classList.add('hidden');
+      if (pwdConfirmEl) pwdConfirmEl.value = '';
+    }
+    if (pwdEl) pwdEl.value = '';
+    hideWelcomeModal();
+    welcomeAcknowledged = false;
+    if (unlockBtn) {
+      unlockBtn.textContent = t('auth.login');
+      unlockBtn.disabled = false;
+    }
+  }
+}
+
+let uidVerifying = false;
+
+const updateUidDisplay = () => {
+  if (uidVerifying) return;
+  const uid = getAccountDigest() || '';
+  if (uidEl) uidEl.value = uid;
+  renderIdenticon(uid, { pending: !uid });
+};
+updateUidDisplay();
+
+let appPrefetched = false;
+function prefetchAppResources() {
+  if (appPrefetched) return;
+  appPrefetched = true;
+  // Prefetch app-mobile.js and bundled CSS for faster post-login page load
+  const urls = [
+    '/app/ui/app-mobile.js',
+    '/assets/app-bundle.css',
+  ];
+  for (const url of urls) {
+    try {
+      const link = document.createElement('link');
+      link.rel = 'prefetch';
+      link.href = url;
+      document.head.appendChild(link);
+    } catch { }
+  }
+}
+
+let preBundlePromise = null;
+
+function markVerifiedUI() {
+  setPasswordAreaVisible(true);
+  if (pwdEl) {
+    requestAnimationFrame(() => {
+      try {
+        pwdEl.focus({ preventScroll: true });
+      } catch { }
+    });
+  }
+  // Preload Argon2 WASM while user types password (eliminates CDN fetch during MK unwrap)
+  loadArgon2().catch(() => {});
+  // Prefetch app.html resources during password-typing idle time
+  prefetchAppResources();
+  // Pre-generate keypair bundle for new accounts during idle time
+  if (!getHasMK() && !preBundlePromise) {
+    preBundlePromise = generateInitialBundle(1, 50).catch(() => null);
+  }
+}
+
+function setUidVerifyingState(active) {
+  if (active) {
+    if (uidVerifying) return;
+    uidVerifying = true;
+    renderIdenticon(null, { pending: true });
+    return;
+  }
+  if (!uidVerifying) return;
+  uidVerifying = false;
+  updateUidDisplay();
+}
+
+
+// ---- Health & Clear ----
+const btnHealth = document.getElementById('btnHealth');
+if (btnHealth) {
+  btnHealth.onclick = async () => {
+    const r = await fetch('/api/health'); const text = await r.text();
+    log({ status: r.status, data: safeJSON(text) });
+  };
+}
+const btnClear = document.getElementById('btnClear');
+if (btnClear) btnClear.onclick = () => { if (out) out.textContent = ''; closeModalMessage(); };
+if (loginErrorClose) loginErrorClose.addEventListener('click', closeModalMessage);
+document.addEventListener('keydown', (e) => {
+  if (e.key !== 'Escape') return;
+  if (welcomeModal && !welcomeModal.classList.contains('hidden')) {
+    hideWelcomeModal();
+    return;
+  }
+  if (loginErrorEl && !loginErrorEl.classList.contains('hidden')) closeModalMessage();
+});
+const PW_ICON_SHOW = '<path d="M12 9a3.02 3.02 0 0 0-3 3c0 1.642 1.358 3 3 3 1.641 0 3-1.358 3-3 0-1.641-1.359-3-3-3z"/><path d="M12 5c-7.633 0-9.927 6.617-9.948 6.684L1.946 12l.105.316C2.073 12.383 4.367 19 12 19s9.927-6.617 9.948-6.684l.106-.316-.105-.316C21.927 11.617 19.633 5 12 5zm0 12c-5.351 0-7.424-3.846-7.926-5C4.578 10.842 6.652 7 12 7c5.351 0 7.424 3.846 7.926 5-.504 1.158-2.578 5-7.926 5z"/>';
+const PW_ICON_HIDE = '<path d="M12 19c.946 0 1.81-.103 2.598-.281l-1.757-1.757c-.273.021-.55.038-.841.038-5.351 0-7.424-3.846-7.926-5a8.642 8.642 0 0 1 1.508-2.297L4.184 8.305c-1.538 1.667-2.121 3.346-2.132 3.379a.994.994 0 0 0 0 .633C2.073 12.383 4.367 19 12 19zm0-14c-1.837 0-3.346.396-4.604.981L3.707 2.293 2.293 3.707l18 18 1.414-1.414-3.319-3.319c2.614-1.951 3.547-4.615 3.561-4.657a.994.994 0 0 0 0-.633C21.927 11.617 19.633 5 12 5zm4.972 10.558-2.28-2.28c.19-.39.308-.819.308-1.278 0-1.641-1.359-3-3-3-.459 0-.888.118-1.277.308L8.915 7.5A9.458 9.458 0 0 1 12 7c5.351 0 7.424 3.846 7.926 5-.302.692-1.166 2.342-2.954 3.558z"/>';
+passwordToggles.forEach((btn) => {
+  btn.addEventListener('click', () => {
+    const id = btn.dataset.target;
+    if (!id) return;
+    const input = document.getElementById(id);
+    if (!input) return;
+    const isMasked = input.classList.contains('pw-masked');
+    input.classList.toggle('pw-masked', !isMasked);
+    const icon = btn.querySelector('.pw-icon');
+    if (icon) {
+      icon.innerHTML = isMasked ? PW_ICON_HIDE : PW_ICON_SHOW;
+      icon.dataset.state = isMasked ? 'hide' : 'show';
+    }
+    btn.setAttribute('aria-label', isMasked ? t('auth.hidePassword') : t('auth.showPassword'));
+  });
+});
+if (welcomeNextBtn) {
+  welcomeNextBtn.addEventListener('click', () => {
+    hideWelcomeModal();
+    if (pwdEl) pwdEl.focus({ preventScroll: true });
+  });
+}
+if (welcomeCloseBtn) {
+  welcomeCloseBtn.addEventListener('click', () => {
+    hideWelcomeModal();
+  });
+}
+
+// ---- SDM Exchange ----
+if (btnSdmExchangeEl) btnSdmExchangeEl.onclick = onSdmExchange;
+async function onSdmExchange() {
+  if (!uidEl || !macEl || !ctrEl) {
+    log({ debugSimError: 'exchange form missing required fields' });
+    throw new Error('exchange form missing required fields');
+  }
+  const uidHex = (uidEl.value || '').replace(/[^0-9a-f]/gi, '').toUpperCase();
+  const macHex = (macEl.value || '').replace(/[^0-9a-f]/gi, '').toUpperCase();
+  const ctrRaw = (ctrEl.value || '').trim();
+  const nonce = (nonceEl?.value || '').trim() || 'n/a';
+  if (!uidHex || uidHex.length < 14) return log('UID hex required (14 hex)');
+  if (!macHex || macHex.length < 16) return log('SDM MAC (16 hex) required');
+  try {
+    await exchangeWithParams({ uidHex, sdmmac: macHex, sdmcounter: ctrRaw, nonce });
+    if (sessionView) sessionView.value = getSession() || '';
+    updateUidDisplay();
+    log({ exchange: { hasMK: getHasMK(), session: !!getSession(), wrapped: !!getWrappedMK() } });
+    newAccount = !getHasMK();
+    if (newAccount) welcomeAcknowledged = false;
+    applyAccountMode();
+    markVerifiedUI();
+    applyBrand();
+  } catch (e) {
+    log({ exchangeError: String(e?.message || e) });
+  }
+}
+
+
+// auto-exchange from URL if params present (via features/sdm)
+(async function autoExchangeFromURL() {
+  try {
+    const sdmParams = parseSdmParams();
+    const hasParams = !!sdmParams;
+    if (hasParams) setUidVerifyingState(true);
+
+    // Fire brand lookup in parallel with SDM exchange so we can show brand
+    // on the splash screen while the full exchange is still in progress.
+    // Brand lookup is a fast GET by UID; SDM exchange is a heavier POST.
+    let brandApplied = false;
+    if (hasParams && sdmParams.uidHex) {
+      brandLookup(sdmParams.uidHex).then(info => {
+        if (brandApplied) return; // SDM exchange already applied brand
+        if (info && (info.brand || info.brand_name || info.brand_logo)) {
+          if (info.brand) setBrandKey(info.brand);
+          if (info.brand_name) setBrandName(info.brand_name);
+          if (info.brand_logo) setBrandLogo(info.brand_logo);
+          applyBrand();
+        }
+      }).catch(() => { /* brand lookup is best-effort */ });
+    }
+
+    const res = await exchangeFromURLIfPresent();
+    if (res && res.performed) {
+      // prefill inputs for visibility
+      updateUidDisplay();
+      sessionView.value = getSession() || '';
+      log({ exchange: { hasMK: getHasMK(), session: !!getSession(), wrapped: !!getWrappedMK() } });
+      newAccount = !getHasMK();
+      if (newAccount) welcomeAcknowledged = false;
+      applyAccountMode();
+      markVerifiedUI();
+      // Apply brand styling based on backend response (authoritative)
+      brandApplied = true;
+      applyBrand();
+    }
+  } catch (e) {
+    log({ exchangeError: String(e?.message || e) });
+  } finally {
+    setUidVerifyingState(false);
+    // Ensure identicon is fully rendered before dismissing splash
+    const uid = getAccountDigest() || '';
+    if (uid) await renderIdenticon(uid);
+    if (typeof window.__hideLoginSplash === 'function') window.__hideLoginSplash();
+  }
+})();
+
+
+// ---- Unlock / Reset ----
+if (unlockBtn) unlockBtn.onclick = onUnlock;
+if (pwdEl) {
+  pwdEl.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter') {
+      event.preventDefault();
+      onUnlock();
+    }
+  });
+}
+if (pwdConfirmEl) {
+  pwdConfirmEl.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter') {
+      event.preventDefault();
+      onUnlock();
+    }
+  });
+}
+const btnResetMK = document.getElementById('btnResetMK');
+if (btnResetMK) btnResetMK.onclick = () => {
+  try {
+    setMkRaw(null);
+    emitMkSetTrace('login-ui:debug-reset', null);
+    log('Local MK cleared.');
+  } catch { }
+};
+
+async function onUnlock() {
+  if (loginInProgress) return;
+  const pwd = pwdEl.value || '';
+  if (!getSession()) { log('Run SDM Exchange first.'); return; }
+  if (!pwd) { log(t('auth.enterPassword')); return; }
+  if (newAccount) {
+    if ((pwd || '').length < 6) {
+      log(t('auth.passwordTooShort'));
+      return;
+    }
+    const confirmPwd = pwdConfirmEl?.value || '';
+    if (confirmPwd !== pwd) {
+      log(t('auth.passwordMismatch'));
+      return;
+    }
+  }
+  try {
+    await ensureAudioPermissionForLogin();
+    if (newAccount) {
+      resetBootstrapProgress();
+      initBootstrapProgress();
+    } else {
+      resetBootstrapProgress();
+      initBootstrapProgress(); // Enable UI for re-login flow (contact-restore)
+    }
+    loginInProgress = true;
+    showLoading(newAccount ? 'BUILDING SECURE ENVIRONMENT...' : 'AUTHENTICATING...');
+    let contactRestorePromise = null;
+    let profileInitPromise = null;
+    const currentPreBundle = newAccount ? preBundlePromise : undefined;
+    preBundlePromise = null; // consumed; re-generated on next exchange if needed
+    const r = await unlockAndInit({
+      password: pwd,
+      preBundle: currentPreBundle,
+      onProgress: (step, status, detail) => {
+        updateBootstrapStep(step, status, detail);
+      },
+      onMkReady: () => {
+        // Start contact restore early — runs in parallel with prekey operations
+        if (!newAccount) {
+          updateBootstrapStep('contact-restore', 'start');
+          contactRestorePromise = hydrateContactSecretsFromBackup({ reason: 'login-bootstrap' })
+            .then((res) => {
+              if (res.ok) {
+                updateBootstrapStep('contact-restore', 'success', t('bootstrap.contactRestoreSuccess', { count: res.entries }));
+              } else if (res.status === 404) {
+                updateBootstrapStep('contact-restore', 'info', t('bootstrap.noBackupData'));
+              } else {
+                updateBootstrapStep('contact-restore', 'skip', t('bootstrap.restoreSkippedOrFailed'));
+              }
+              return res;
+            })
+            .catch((err) => {
+              log({ contactRestoreError: err?.message || err });
+              updateBootstrapStep('contact-restore', 'error', t('bootstrap.restoreFailed'));
+              return { ok: false };
+            });
+        }
+      },
+      onDeviceReady: (info) => {
+        // Start profile init early — runs in parallel with wrapDevice + storeDevkeys
+        if (newAccount) {
+          updateBootstrapStep('nickname-init', 'start');
+          updateBootstrapStep('avatar-init', 'start');
+          profileInitPromise = initProfileDefaultsOnce({ uidHex: getAccountDigest(), evidence: info?.evidence || null })
+            .then((result) => {
+              if (result?.skipped) {
+                const reason = result.reason || t('bootstrap.existingNicknameAvatar');
+                updateBootstrapStep('nickname-init', 'skip', reason);
+                updateBootstrapStep('avatar-init', 'skip', reason);
+              } else {
+                updateBootstrapStep('nickname-init', 'success');
+                if (result?.avatarWritten) {
+                  updateBootstrapStep('avatar-init', 'success');
+                } else {
+                  updateBootstrapStep('avatar-init', 'skip', result?.avatarReason || t('bootstrap.existingAvatar'));
+                }
+              }
+              return result;
+            })
+            .catch((err) => {
+              const msg = err?.message || err;
+              updateBootstrapStep('nickname-init', 'error', msg);
+              updateBootstrapStep('avatar-init', 'error', msg);
+              return { _profileError: err };
+            });
+        }
+      }
+    });
+    log({ unlocked: r.unlocked, initialized: r.initialized, replenished: r.replenished, next_opk_id: r.next_opk_id });
+    const devicePriv = getDevicePriv();
+    const hasPrekeys = !!(devicePriv &&
+      typeof devicePriv.ik_priv_b64 === 'string' && devicePriv.ik_priv_b64 &&
+      typeof devicePriv.spk_priv_b64 === 'string' && devicePriv.spk_priv_b64 &&
+      typeof devicePriv.spk_pub_b64 === 'string' && devicePriv.spk_pub_b64);
+    if (!hasPrekeys) {
+      hideLoading();
+      loginInProgress = false;
+      log(t('auth.preSharedKeyNotReady'));
+      return;
+    }
+    let deviceIdAfterUnlock = null;
+    try {
+      deviceIdAfterUnlock = ensureDeviceId();
+      console.log('[login-ui] deviceId:ensure:post-unlock', deviceIdAfterUnlock);
+    } catch (err) {
+      log({ deviceIdError: err?.message || err });
+      throw err;
+    }
+    try {
+      const stored = sessionStorage?.getItem('device_id');
+      console.log('[login-ui] deviceId:sessionStorage', stored || null);
+    } catch (err) {
+      log({ deviceIdStorageError: err?.message || err });
+    }
+    // Await profile init started in onDeviceReady (parallel with wrapDevice + storeDevkeys)
+    if (newAccount) {
+      if (profileInitPromise) {
+        const result = await profileInitPromise;
+        if (result?._profileError) throw result._profileError;
+      } else {
+        // Fallback: onDeviceReady was not called (e.g. existing backup path)
+        updateBootstrapStep('nickname-init', 'start');
+        updateBootstrapStep('avatar-init', 'start');
+        try {
+          const result = await initProfileDefaultsOnce({ uidHex: getAccountDigest(), evidence: r?.evidence || null });
+          if (result?.skipped) {
+            const reason = result.reason || t('bootstrap.existingNicknameAvatar');
+            updateBootstrapStep('nickname-init', 'skip', reason);
+            updateBootstrapStep('avatar-init', 'skip', reason);
+          } else {
+            updateBootstrapStep('nickname-init', 'success');
+            if (result?.avatarWritten) {
+              updateBootstrapStep('avatar-init', 'success');
+            } else {
+              updateBootstrapStep('avatar-init', 'skip', result?.avatarReason || t('bootstrap.existingAvatar'));
+            }
+          }
+        } catch (err) {
+          const msg = err?.message || err;
+          updateBootstrapStep('nickname-init', 'error', msg);
+          updateBootstrapStep('avatar-init', 'error', msg);
+          throw err;
+        }
+      }
+    }
+    await emitIdentityTrace('login-ui:post-unlock');
+    try {
+      const deviceIdBeforeRedirect = ensureDeviceId();
+      console.log('[login-ui] deviceId:ensure:before-redirect', deviceIdBeforeRedirect);
+    } catch (err) {
+      log({ deviceIdBeforeRedirectError: err?.message || err });
+      throw err;
+    }
+    if (!newAccount) {
+      // Await contact restore started in onMkReady (parallel with prekeys)
+      if (contactRestorePromise) {
+        await contactRestorePromise;
+      } else {
+        // Fallback: onMkReady was not called (should not happen)
+        updateBootstrapStep('contact-restore', 'start');
+        try {
+          const restoreRes = await hydrateContactSecretsFromBackup({ reason: 'login-bootstrap' });
+          if (restoreRes.ok) {
+            updateBootstrapStep('contact-restore', 'success', t('bootstrap.contactRestoreSuccess', { count: restoreRes.entries }));
+          } else if (restoreRes.status === 404) {
+            updateBootstrapStep('contact-restore', 'info', t('bootstrap.noBackupData'));
+          } else {
+            updateBootstrapStep('contact-restore', 'skip', t('bootstrap.restoreSkippedOrFailed'));
+          }
+        } catch (err) {
+          log({ contactRestoreError: err?.message || err });
+          updateBootstrapStep('contact-restore', 'error', t('bootstrap.restoreFailed'));
+        }
+      }
+    }
+    updateUidDisplay();
+    // Set progress to 70% (matches app.html initial bar-fill) for seamless visual handoff
+    setTransitionProgress(70, 'LOADING SECURE SESSION...');
+    // handoff MK/UID to next page (sessionStorage, same-tab only)
+    try {
+      const mk = getMkRaw();
+      const accountToken = getAccountToken();
+      const accountDigest = getAccountDigest();
+      const wrappedMk = getWrappedMK();
+      const identityForHandoff = accountDigest || null;
+      log({
+        loginHandoff: {
+          mk: !!mk,
+          uid: !!identityForHandoff,
+          accountToken: !!accountToken,
+          accountDigest: !!accountDigest,
+          wrappedMk: !!wrappedMk,
+          wrappedDev: !!r?.wrapped_dev
+        }
+      });
+      if (mk && mk.length) sessionStorage.setItem('mk_b64', b64(mk));
+      // handoff 以 accountDigest 為主（不再使用 uid_hex）
+      if (accountToken) sessionStorage.setItem('account_token', accountToken);
+      if (accountDigest) sessionStorage.setItem('account_digest', accountDigest);
+      if (wrappedMk) {
+        try {
+          sessionStorage.setItem('wrapped_mk', JSON.stringify(wrappedMk));
+        } catch (err) {
+          log({ wrappedMkSerializeError: err?.message || err });
+        }
+      } else {
+        sessionStorage.removeItem('wrapped_mk');
+      }
+      const isAutomationEnv = (() => {
+        try { return typeof navigator !== 'undefined' && !!navigator.webdriver; } catch { return false; }
+      })();
+      if (r?.wrapped_dev) {
+        const serializedWrapped = JSON.stringify(r.wrapped_dev);
+        sessionStorage.setItem('wrapped_dev', serializedWrapped);
+        try { localStorage.setItem('wrapped_dev_handoff', serializedWrapped); } catch { }
+        try { window.name = JSON.stringify({ wrapped_dev: r.wrapped_dev }); } catch { }
+        if (isAutomationEnv) {
+          try {
+            console.log('[login-handoff] wrapped_dev stored', serializedWrapped.length);
+          } catch { }
+        }
+      } else {
+        sessionStorage.removeItem('wrapped_dev');
+        try { localStorage.removeItem('wrapped_dev_handoff'); } catch { }
+        try { window.name = ''; } catch { }
+        if (isAutomationEnv) {
+          try { console.warn('[login-handoff] wrapped_dev missing'); } catch { }
+        }
+      }
+      try {
+        const keyOptions = getContactSecretKeyOptionsForLogin();
+        const storageKeys = getContactSecretsStorageKeys(keyOptions);
+        const snapshotRecord = readContactSnapshotFrom(localStorage, storageKeys);
+        if (snapshotRecord?.value) {
+          for (const key of storageKeys) {
+            sessionStorage.setItem(key, snapshotRecord.value);
+          }
+        } else {
+          for (const key of storageKeys) {
+            sessionStorage.removeItem(key);
+          }
+        }
+        if (!newAccount) {
+          sessionStorage.setItem('contact_restore_performed', '1');
+        }
+      } catch (err) {
+        log({ contactSecretHandoffError: err?.message || err });
+      }
+    } catch { }
+    // Clear password values before redirect to prevent any lingering autofill triggers
+    if (pwdEl) pwdEl.value = '';
+    if (pwdConfirmEl) pwdConfirmEl.value = '';
+    // sessionStorage is synchronous — redirect immediately for seamless transition
+    location.replace(window.location.origin + '/pages/app.html');
+  } catch (e) {
+    hideLoading();
+    loginInProgress = false;
+    log({ unlockError: String(e?.message || e) });
+  }
+}
+
+function invalidateExchange() {
+  setSession(null);
+  setHasMK(false);
+  setWrappedMK(null);
+  setUidHex(null);
+  setAccountToken(null);
+  setAccountDigest(null);
+  setOpaqueServerId(null);
+  try {
+    sessionStorage.removeItem('account_token');
+    sessionStorage.removeItem('account_digest');
+  } catch { }
+  newAccount = false;
+  welcomeAcknowledged = false;
+  applyAccountMode();
+}
+
+
+const FALLBACK_ERROR_MESSAGE = t('errors.fallbackError');
+const PASSWORD_ERROR_MESSAGE = t('errors.passwordIncorrect');
+
+const ERROR_CODE_MESSAGES = {
+  ConfigError: t('errors.configError'),
+  Unauthorized: t('errors.unauthorized'),
+  ExchangeFailed: t('errors.exchangeFailed'),
+  Replay: t('errors.replay'),
+  SessionExpired: t('errors.sessionExpired'),
+  SessionMismatch: t('errors.sessionMismatch'),
+  StoreFailed: t('errors.storeFailed'),
+  BadRequest: t('errors.badRequest'),
+  OpaqueLoginFinishFailed: PASSWORD_ERROR_MESSAGE,
+  OpaqueSessionExpired: t('errors.opaqueSessionExpired'),
+  OpaqueSessionNotFound: t('errors.opaqueSessionNotFound')
+};
+
+const ERROR_PATTERNS = [
+  { pattern: /uid hex \(14\) required/i, message: t('errors.uidNotDetected') },
+  { pattern: /sdm mac \(16\) required/i, message: t('errors.macMissing') },
+  { pattern: /password required/i, message: t('errors.enterUnlockPassword') },
+  { pattern: /請輸入密碼。?/i, message: t('auth.enterPassword') },
+  { pattern: /密碼至少需 6 個字元/i, message: t('auth.passwordTooShort') },
+  { pattern: /兩次輸入的密碼不一致/i, message: t('auth.passwordMismatch') },
+  { pattern: /sdm exchange required/i, message: t('errors.completeChipVerification') },
+  { pattern: /uid not set/i, message: t('errors.uidNotDetected') },
+  { pattern: /wrong password or envelope mismatch/i, message: t('errors.passwordIncorrect') },
+  { pattern: /unlock failed/i, message: PASSWORD_ERROR_MESSAGE },
+  { pattern: /enter a password first/i, message: t('errors.enterUnlockPassword') },
+  { pattern: /run sdm exchange first/i, message: t('errors.completeChipScanFirst') },
+  { pattern: /mk\.store failed/i, message: t('errors.masterKeyStoreFailed') },
+  { pattern: /initialize mk failed/i, message: t('errors.masterKeyInitFailed') },
+  { pattern: /devkeys\.fetch failed/i, message: t('errors.deviceBackupReadFailed') },
+  { pattern: /keys\.publish.*failed/i, message: t('errors.deviceKeySyncFailed') },
+  { pattern: /devkeys\.store.*failed/i, message: t('errors.deviceBackupStoreFailed') },
+  { pattern: /prekeys initialization failed/i, message: t('errors.prekeysInitFailed') },
+  { pattern: /prekeys re-initialization failed/i, message: t('errors.prekeysReinitFailed') },
+  { pattern: /prekeys replenish failed/i, message: t('errors.prekeysReplenishFailed') },
+  { pattern: /please re-tap the tag/i, message: t('errors.sessionExpired') },
+  { pattern: /counter must be strictly increasing/i, message: t('errors.replay') },
+  { pattern: /uid mismatch/i, message: t('errors.sessionMismatch') },
+  { pattern: /sdm verify failed/i, message: t('errors.chipVerifyFailed') },
+  { pattern: /opaque login.*failed/i, message: PASSWORD_ERROR_MESSAGE },
+  { pattern: /opaque.*password/i, message: PASSWORD_ERROR_MESSAGE },
+  { pattern: /OpaqueLoginFinishFailed/i, message: PASSWORD_ERROR_MESSAGE },
+  { pattern: /EnvelopeRecoveryError/i, message: PASSWORD_ERROR_MESSAGE },
+  { pattern: /MK_UNWRAP_FAILED_HARDBLOCK/i, message: PASSWORD_ERROR_MESSAGE }
+];
+
+function parseLinePayload(line) {
+  if (line === null || line === undefined) return '';
+  if (typeof line === 'string') {
+    const trimmed = line.trim();
+    if (!trimmed) return '';
+    try { return JSON.parse(trimmed); } catch { return trimmed; }
+  }
+  return line;
+}
+
+function translateError(line) {
+  const payload = parseLinePayload(line);
+  let msg = null;
+  if (typeof payload === 'string') {
+    msg = translateString(payload);
+  } else {
+    msg = translateFromObj(payload);
+  }
+  return msg || FALLBACK_ERROR_MESSAGE;
+}
+
+function translateFromObj(obj) {
+  if (!obj || typeof obj !== 'object') return null;
+  if (Array.isArray(obj)) {
+    for (const item of obj) {
+      const msg = translateFromObj(item);
+      if (msg) return msg;
+    }
+    return null;
+  }
+  if (obj.exchangeError) return translateString(obj.exchangeError);
+  if (obj.unlockError) return translateString(obj.unlockError);
+  if (obj.error) {
+    const codeMsg = translateErrorCode(obj.error, obj);
+    if (codeMsg) return codeMsg;
+  }
+  if (obj.details) {
+    const detailMsg = translateDetail(obj.details);
+    if (detailMsg) return detailMsg;
+  }
+  if (obj.message && typeof obj.message === 'string') {
+    const message = translateString(obj.message);
+    if (message) return message;
+  }
+  if (obj.detail && typeof obj.detail === 'string') {
+    const message = translateString(obj.detail);
+    if (message) return message;
+  }
+  if (typeof obj.status === 'number' && obj.status >= 400 && obj.statusText) {
+    const message = translateString(String(obj.statusText));
+    if (message) return message;
+  }
+  return null;
+}
+
+function translateDetail(detail) {
+  if (!detail) return null;
+  if (typeof detail === 'string') return translateString(detail);
+  return translateFromObj(detail);
+}
+
+function translateString(str) {
+  if (!str) return null;
+  const trimmed = str.trim();
+  if (!trimmed) return null;
+  try {
+    const obj = JSON.parse(trimmed);
+    const fromObj = translateFromObj(obj);
+    if (fromObj) return fromObj;
+  } catch {
+    // not JSON
+  }
+  if (trimmed.includes('sdm.exchange failed')) {
+    const idx = trimmed.indexOf('sdm.exchange failed:');
+    if (idx >= 0) {
+      const payload = trimmed.slice(idx + 21).trim();
+      const translated = translateString(payload);
+      if (translated) return translated;
+      return ERROR_CODE_MESSAGES.ExchangeFailed;
+    }
+  }
+  if (trimmed.includes('please re-tap the tag')) return ERROR_CODE_MESSAGES.SessionExpired;
+  if (trimmed.includes('counter must be strictly increasing')) return t('errors.replay');
+
+  const patternMsg = findPatternMessage(trimmed);
+  if (patternMsg) return patternMsg;
+  return null;
+}
+
+function translateErrorCode(code, source) {
+  if (!code) return null;
+  if (code === 'ExchangeFailed' && source && source.details) {
+    const detailMsg = translateDetail(source.details);
+    if (detailMsg) return detailMsg;
+  }
+  if (source && source.details) {
+    const detailMsg = translateDetail(source.details);
+    if (detailMsg) return detailMsg;
+  }
+  if (ERROR_CODE_MESSAGES[code]) return ERROR_CODE_MESSAGES[code];
+  return null;
+}
+
+function findPatternMessage(str) {
+  for (const item of ERROR_PATTERNS) {
+    if (item.pattern.test(str)) return item.message;
+  }
+  return null;
+}
+
+function shouldShowModal(line) {
+  const translated = translateError(line);
+  if (translated && translated !== FALLBACK_ERROR_MESSAGE) return true;
+  try {
+    if (typeof line === 'string') {
+      const lower = line.toLowerCase();
+      if (lower.includes('error') || lower.includes('fail') || lower.includes('failed') || lower.includes('失敗')) return true;
+      const obj = JSON.parse(line);
+      if (obj && (obj.error || obj.errors || obj.status >= 400)) return true;
+      return false;
+    }
+    if (line && typeof line === 'object') {
+      if (typeof line.status === 'number' && line.status >= 400) return true;
+      if ('error' in line || 'errors' in line) return true;
+    }
+  } catch {
+    /* ignore */
+  }
+  return false;
+}
+
+function showModalMessage(line) {
+  if (!loginErrorEl || !loginErrorText) return;
+  loginErrorText.textContent = translateError(line);
+  loginErrorEl.classList.remove('hidden');
+  // Re-trigger fade-in animation
+  loginErrorEl.style.animation = 'none';
+  loginErrorEl.offsetHeight; // force reflow
+  loginErrorEl.style.animation = '';
+}
+
+function closeModalMessage() {
+  if (!loginErrorEl || !loginErrorText) return;
+  loginErrorText.textContent = '';
+  loginErrorEl.classList.add('hidden');
+}
+
+// ---- small utils ----
+function safeJSON(text) { try { return JSON.parse(text); } catch { return text; } }
+function b64(u8) { let s = ''; for (let i = 0; i < u8.length; i++) s += String.fromCharCode(u8[i]); return btoa(s); }
+function b64u8(b64s) { const bin = atob(b64s); const u8 = new Uint8Array(bin.length); for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i); return u8; }
+
+// Harden: disable password storing/autofill on all inputs
+(function hardenInputs() {
+  try {
+    const els = document.querySelectorAll('input, textarea');
+    els.forEach(el => {
+      el.setAttribute('autocomplete', 'off');
+      el.setAttribute('autocapitalize', 'off');
+      el.setAttribute('autocorrect', 'off');
+      el.setAttribute('spellcheck', 'false');
+      el.setAttribute('data-1p-ignore', 'true');
+      el.setAttribute('data-lpignore', 'true');
+    });
+  } catch { }
+})();
+async function ensureAudioPermissionForLogin() {
+  if (typeof window === 'undefined') return;
+  if (sessionStorage.getItem(AUDIO_PERMISSION_KEY) === 'granted') return;
+  const AudioCtx = window.AudioContext || window.webkitAudioContext;
+  if (!AudioCtx) {
+    sessionStorage.setItem(AUDIO_PERMISSION_KEY, 'unsupported');
+    return;
+  }
+  try {
+    const ctx = new AudioCtx();
+    await ctx.resume().catch(() => { });
+    const buffer = ctx.createBuffer(1, 1, 22050);
+    const source = ctx.createBufferSource();
+    source.buffer = buffer;
+    source.connect(ctx.destination);
+    try { source.start(0); } catch { }
+    sessionStorage.setItem(AUDIO_PERMISSION_KEY, 'granted');
+    try { await ctx.close(); } catch { }
+    log({ audioPermission: 'granted' });
+  } catch (err) {
+    log({ audioPermissionError: err?.message || err });
+  }
+}

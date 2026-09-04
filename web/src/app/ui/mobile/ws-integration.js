@@ -1,0 +1,973 @@
+// WebSocket transport + message routing
+//
+// Manages: connection lifecycle, auth token, reconnect, send queue, monitor,
+// and incoming message dispatch (presence, secure-message, invite, etc.)
+//
+// Usage:
+//   const ws = createWsIntegration({ deps: { ... } });
+//   ws.startMonitor();
+//   ws.ensure();          // connect when ready
+//   ws.send(payload);     // queue-safe send
+//   ws.close();           // teardown on logout
+
+import { t } from '/locales/index.js';
+import { isNativeAccountSocketMode } from './native-websocket.js';
+import { postNativeMessage, onNativeEvent } from '../../features/native-bridge.js';
+
+export function createWsIntegration({ deps }) {
+  const {
+    log, logForensicsEvent, wsDebugEnabled,
+    getAccountDigest, getAccountToken, getLoginSessionTs,
+    normalizePeerIdentity, normalizeAccountDigest, normalizePeerDeviceId,
+    getDeviceId, ensureDeviceId, getContactSecret,
+    sessionStore, requestWsToken, flushOutbox,
+    handleCallSignalMessage, handleCallAuxMessage,
+    messagesFlowFacade,
+    updateConnectionIndicator,
+    isSettingsConversationId,
+    handleSettingsSecureMessage,
+    connectionIndicatorEl,
+    // Late-bound via getters (not yet created at instantiation time)
+    getPresenceManager,
+    getMessagesPane,
+    getShareController,
+    // Callbacks into app-mobile
+    showForcedLogoutModal,
+    secureLogout,
+    loadInitialContacts,
+    hydrateProfileSnapshots,
+    isHydrationComplete
+  } = deps;
+
+  // --- Tuning constants ---
+  const RECONNECT_BASE_DELAY = 2000;
+  const RECONNECT_MAX_DELAY  = 30000;
+  const HEARTBEAT_INTERVAL   = 30000;   // send ping every 30s
+  const HEARTBEAT_TIMEOUT    = 45000;   // no pong within 45s → dead
+  const CONNECT_TIMEOUT      = 15000;   // CONNECTING state max age
+  const PENDING_QUEUE_LIMIT  = 200;
+
+  // --- Network quality detection ---
+  const RTT_WINDOW_SIZE  = 3;      // sliding window of last N pong RTTs
+  const RTT_DEGRADED_MS  = 3000;   // avg RTT ≥ 3 s → degraded
+
+  // --- Connection state ---
+  let wsConn = null;
+  let wsReconnectTimer = null;
+  let wsAuthTokenInfo = null;
+  const pendingMessages = [];
+  let connectTimeoutTimer = null;
+  let reconnectAttempts = 0;
+  let connectStartedAt = 0;
+  let lastPongAt = 0;
+  let heartbeatTimer = null;
+  let connecting = false;
+
+  // --- RTT state ---
+  let lastPingSentAt = 0;
+  const rttSamples = [];
+  let lastQuality = 'good';  // 'good' | 'degraded'
+
+  // --- Auth ---
+
+  async function getAuthToken({ force = false } = {}) {
+    const accountDigest = getAccountDigest();
+    if (!accountDigest) throw new Error(t('errors.missingAccountDigest'));
+    const nowSec = Math.floor(Date.now() / 1000);
+    if (!force && wsAuthTokenInfo && wsAuthTokenInfo.token) {
+      const exp = Number(wsAuthTokenInfo.expiresAt || 0);
+      if (!exp || exp - nowSec > 30) {
+        return wsAuthTokenInfo;
+      }
+    }
+    const accountToken = getAccountToken();
+    const sessionTs = getLoginSessionTs();
+    const { r, data } = await requestWsToken({ accountToken, accountDigest, sessionTs });
+    if (!r.ok || !data?.token) {
+      const message = typeof data === 'string' ? data : data?.message || data?.error || 'ws token failed';
+      const err = new Error(message);
+      err.status = r.status;
+      err.code = typeof data === 'object' ? (data?.error || null) : null;
+      throw err;
+    }
+    const expiresAt = Number(data.expires_at || data.expiresAt || data.exp || 0) || null;
+    const wsUrlDirect = typeof data.ws_url === 'string' ? data.ws_url.trim() : '';
+    wsAuthTokenInfo = { token: data.token, expiresAt, ws_url: wsUrlDirect || null };
+    return wsAuthTokenInfo;
+  }
+
+  // --- Reconnect ---
+
+  function scheduleReconnect(baseDelay = RECONNECT_BASE_DELAY) {
+    if (wsReconnectTimer) clearTimeout(wsReconnectTimer);
+    const backoff = Math.min(baseDelay * Math.pow(2, reconnectAttempts), RECONNECT_MAX_DELAY);
+    const jitter = Math.floor(Math.random() * backoff * 0.3);
+    const delay = backoff + jitter;
+    reconnectAttempts++;
+    log({ wsScheduleReconnect: true, attempt: reconnectAttempts, delay });
+    wsReconnectTimer = setTimeout(() => {
+      wsReconnectTimer = null;
+      connecting = true;
+      connect().catch((err) => {
+        log({ wsReconnectError: err?.message || err });
+      }).finally(() => { connecting = false; });
+    }, delay);
+  }
+
+  // --- Native autonomous transport (Option B / B2) ---
+
+  let nativeAutoWired = false;
+  let nativeAutoReady = false;
+
+  // Hand the account-WS lifecycle to native. Native fetches the token, opens the
+  // socket, authenticates, heartbeats and reconnects; web only sends/receives
+  // application messages. A pseudo `wsConn` keeps send()/send.isReady() working
+  // unchanged. Connection state arrives as wsUp/wsDown, messages as wsMsg.
+  function connectViaNativeAutonomous(accountDigest) {
+    const accountToken = (typeof getAccountToken === 'function') ? getAccountToken() : null;
+    const deviceId = getDeviceId() || ensureDeviceId() || '';
+    const sessionTs = (typeof getLoginSessionTs === 'function') ? getLoginSessionTs() : undefined;
+    // Absolute backend origin for native's token fetch (URLSession has no
+    // "same-origin"). Bundled mode injects window.API_ORIGIN; remote mode doesn't,
+    // so fall back to the page origin (which IS the backend in remote mode).
+    const apiOrigin = (typeof globalThis !== 'undefined' && typeof globalThis.API_ORIGIN === 'string' && globalThis.API_ORIGIN.trim())
+      ? globalThis.API_ORIGIN.trim()
+      : ((typeof location !== 'undefined' && location.origin && location.origin.startsWith('http')) ? location.origin : '');
+
+    // Pseudo connection: readyState mirrors native auth state; send/close proxy
+    // to native. The rest of ws-integration (send queue, isReady) is unchanged.
+    wsConn = {
+      get readyState() { return nativeAutoReady ? 1 /* OPEN */ : 0 /* CONNECTING */; },
+      send(str) { postNativeMessage('wsSendApp', { data: str }); },
+      close() { nativeAutoReady = false; postNativeMessage('wsCloseNative', {}); },
+    };
+
+    if (!nativeAutoWired) {
+      nativeAutoWired = true;
+      onNativeEvent('wsUp', () => {
+        nativeAutoReady = true;
+        reconnectAttempts = 0;
+        connecting = false;
+        updateConnectionIndicator('online');
+        if (pendingMessages.length) {
+          for (const msg of pendingMessages.splice(0)) {
+            try { postNativeMessage('wsSendApp', { data: JSON.stringify(msg) }); }
+            catch (err) { log({ wsSendError: err?.message || err }); }
+          }
+        }
+      });
+      onNativeEvent('wsMsg', (d) => {
+        let msg;
+        try { msg = JSON.parse(d?.data); } catch { return; }
+        handleMessage(msg);
+      });
+      onNativeEvent('wsDown', (d) => {
+        nativeAutoReady = false;
+        updateConnectionIndicator('offline');
+        getPresenceManager()?.clearPresenceState?.();
+        // 4409 stale-session is terminal; native stops reconnecting and we force
+        // logout exactly as the browser-WS onclose path does.
+        if (d && d.code === 4409) {
+          showForcedLogoutModal(t('auth.accountLoggedInElsewhere'));
+          secureLogout(t('auth.accountLoggedInElsewhere'), { auto: true });
+        }
+        // Otherwise native owns reconnect; web takes no action.
+      });
+    }
+
+    postNativeMessage('wsConfigure', {
+      accountToken, accountDigest, deviceId, apiOrigin,
+      sessionTs: Number.isFinite(sessionTs) ? Math.floor(sessionTs) : undefined,
+    });
+    postNativeMessage('wsEnsureNative', {});
+    connecting = false;
+  }
+
+  // --- Connect ---
+
+  async function connect() {
+    const accountDigest = getAccountDigest();
+    if (!accountDigest) return;
+    // Native app (Option B): the native layer owns the whole account-WS lifecycle
+    // (token / auth / heartbeat / reconnect) so the connection survives mid-call
+    // backgrounding when the WebView JS is throttled. Web just sends / receives
+    // application messages. Pure web / App Clip keep the browser WebSocket below.
+    if (isNativeAccountSocketMode()) {
+      connectViaNativeAutonomous(accountDigest);
+      return;
+    }
+    if (wsDebugEnabled) {
+      log({ wsConnectStart: true, accountDigest });
+    }
+    let tokenInfo;
+    try {
+      tokenInfo = await getAuthToken();
+    } catch (err) {
+      log({ wsTokenError: err?.message || err, status: err?.status, code: err?.code });
+      if (err?.status === 409 || err?.code === 'StaleSession') {
+        showForcedLogoutModal(t('auth.accountLoggedInElsewhere'));
+        secureLogout(t('auth.accountLoggedInElsewhere'), { auto: true });
+        return;
+      }
+      scheduleReconnect(4000);
+      return;
+    }
+    // If the token response includes a direct WS URL from the Worker, prefer it
+    // (bypasses the Pages proxy which may not forward WebSocket upgrades reliably).
+    const directWsUrl = tokenInfo?.ws_url || '';
+    const deviceId = getDeviceId() || ensureDeviceId() || '';
+    const tokenParam = encodeURIComponent(tokenInfo.token);
+    let wsUrl;
+    if (directWsUrl) {
+      try {
+        const parsed = new URL(directWsUrl);
+        parsed.searchParams.set('token', tokenInfo.token);
+        if (deviceId) parsed.searchParams.set('deviceId', deviceId);
+        wsUrl = parsed.toString();
+      } catch {
+        // fall through to legacy URL construction
+      }
+    }
+    if (!wsUrl) {
+      let proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+      let baseHost = connectionIndicatorEl?.dataset?.wsHost || '';
+      let path = connectionIndicatorEl?.dataset?.wsPath || '/api/ws';
+      const apiOriginRaw = typeof globalThis !== 'undefined' && typeof globalThis.API_ORIGIN === 'string'
+        ? globalThis.API_ORIGIN.trim()
+        : '';
+      if (apiOriginRaw) {
+        try {
+          const originUrl = new URL(apiOriginRaw);
+          baseHost = originUrl.host || baseHost;
+          // Derive ws/wss from the API origin (not location.protocol): when the
+          // page is served from a custom scheme (native bundled app) we still
+          // want wss for an https backend.
+          proto = originUrl.protocol === 'https:' ? 'wss:' : 'ws:';
+          const prefix = originUrl.pathname && originUrl.pathname !== '/' ? originUrl.pathname.replace(/\/$/, '') : '';
+          if (prefix) {
+            path = path.startsWith('/') ? `${prefix}${path}` : `${prefix}/${path}`;
+          }
+        } catch (err) {
+          log({ apiOriginParseError: err?.message || err });
+        }
+      }
+      if (!baseHost) baseHost = location.host;
+      if (!path.startsWith('/')) path = `/${path}`;
+      wsUrl = `${proto}//${baseHost}${path}?token=${tokenParam}${deviceId ? `&deviceId=${encodeURIComponent(deviceId)}` : ''}`;
+    }
+    if (wsDebugEnabled) {
+      log({ wsConnectUrl: wsUrl });
+    }
+    connectStartedAt = Date.now();
+    const ws = new WebSocket(wsUrl);
+    wsConn = ws;
+    updateConnectionIndicator('connecting');
+
+    // Event-driven connect timeout: if onopen doesn't fire within CONNECT_TIMEOUT, abort.
+    if (connectTimeoutTimer) clearTimeout(connectTimeoutTimer);
+    connectTimeoutTimer = setTimeout(() => {
+      connectTimeoutTimer = null;
+      if (ws === wsConn && ws.readyState === WebSocket.CONNECTING) {
+        log({ wsConnectTimeout: true, elapsed: Date.now() - connectStartedAt });
+        try { ws.close(); } catch { }
+        wsConn = null;
+        connecting = false;
+        scheduleReconnect();
+      }
+    }, CONNECT_TIMEOUT);
+
+    ws.onopen = () => {
+      if (ws !== wsConn) return;
+      if (connectTimeoutTimer) { clearTimeout(connectTimeoutTimer); connectTimeoutTimer = null; }
+      if (wsDebugEnabled) {
+        log({ wsState: 'open' });
+      }
+      wsReconnectTimer = null;
+      connecting = false;
+      reconnectAttempts = 0;
+      startHeartbeat();
+      try {
+        ws.send(JSON.stringify({ type: 'auth', accountDigest, token: tokenInfo.token }));
+      } catch (err) {
+        log({ wsAuthSendError: err?.message || err });
+      }
+      if (pendingMessages.length) {
+        for (const msg of pendingMessages.splice(0)) {
+          try {
+            ws.send(JSON.stringify(msg));
+          } catch (err) {
+            log({ wsSendError: err?.message || err });
+          }
+        }
+      }
+    };
+    ws.onmessage = (event) => {
+      if (ws !== wsConn) return;
+      if (wsDebugEnabled) {
+        log({ wsMessageRaw: event.data });
+      }
+      let msg;
+      try { msg = JSON.parse(event.data); } catch { return; }
+      const msgType = msg?.type || null;
+      if (isForensicsWsSecureMessage(msgType)) {
+        try {
+          logForensicsEvent('WS_RECV', buildForensicsSummary(msg));
+        } catch { }
+      }
+      handleMessage(msg);
+    };
+    ws.onclose = (evt) => {
+      if (ws !== wsConn) return;
+      if (connectTimeoutTimer) { clearTimeout(connectTimeoutTimer); connectTimeoutTimer = null; }
+      if (wsDebugEnabled) {
+        log({ wsClose: { code: evt.code, reason: evt.reason } });
+      }
+      wsConn = null;
+      updateConnectionIndicator('offline');
+      getPresenceManager()?.clearPresenceState?.();
+      if (evt.code === 4409) {
+        showForcedLogoutModal(t('auth.accountLoggedInElsewhere'));
+        secureLogout(t('auth.accountLoggedInElsewhere'), { auto: true });
+        return;
+      }
+      if (evt.code === 4401) {
+        wsAuthTokenInfo = null;
+      }
+      scheduleReconnect();
+    };
+    ws.onerror = () => {
+      if (ws !== wsConn) return;
+      if (connectTimeoutTimer) { clearTimeout(connectTimeoutTimer); connectTimeoutTimer = null; }
+      if (wsDebugEnabled) {
+        log({ wsError: true });
+      }
+      updateConnectionIndicator('offline');
+      wsAuthTokenInfo = null;
+      try { ws.close(); } catch { }
+    };
+  }
+
+  // --- Send ---
+
+  function send(payload) {
+    if (!wsConn || wsConn.readyState !== WebSocket.OPEN) {
+      if (pendingMessages.length >= PENDING_QUEUE_LIMIT) {
+        pendingMessages.shift();
+        log({ wsPendingQueueOverflow: true, limit: PENDING_QUEUE_LIMIT });
+      }
+      pendingMessages.push(payload);
+      ensure();
+      return false;
+    }
+    try {
+      wsConn.send(JSON.stringify(payload));
+      return true;
+    } catch (err) {
+      log({ wsSendError: err?.message || err });
+      pendingMessages.push(payload);
+      ensure();
+      return false;
+    }
+  }
+
+  send.isReady = () => !!(wsConn && wsConn.readyState === WebSocket.OPEN);
+
+  // --- Ensure / Monitor ---
+
+  function ensure() {
+    if (wsConn || wsReconnectTimer || connecting) return;
+    const digest = getAccountDigest();
+    if (!digest) {
+      log({ wsSkip: 'missing_account_digest' });
+      return;
+    }
+    if (!isHydrationComplete()) {
+      if (wsDebugEnabled) console.log('[ws-ensure] Skipped: Hydration pending');
+      return;
+    }
+    log({ wsEnsure: true, state: wsConn?.readyState ?? 'none' });
+    connecting = true;
+    connect().catch((err) => {
+      log({ wsConnectError: err?.message || err });
+    }).finally(() => { connecting = false; });
+  }
+
+  // startMonitor is now a no-op: connection monitoring is fully event-driven.
+  // - Connect timeout: one-shot setTimeout in connect(), cleared on open/close/error.
+  // - Disconnect: onclose fires scheduleReconnect() automatically.
+  // - Heartbeat timeout: detected in heartbeat interval, triggers close → onclose.
+  function startMonitor() { }
+
+  /**
+   * Pause heartbeat when app goes to background.
+   * Reduces CPU/battery usage while the page is hidden.
+   */
+  function pause() {
+    stopHeartbeat();
+  }
+
+  /**
+   * Resume heartbeat when app returns to foreground.
+   * Also re-checks connection state in case it dropped while backgrounded.
+   */
+  function resume() {
+    if (wsConn && wsConn.readyState === WebSocket.OPEN) {
+      startHeartbeat();
+    } else {
+      // Connection may have dropped while backgrounded — reconnect
+      ensure();
+    }
+  }
+
+  // --- Heartbeat (application-level ping/pong) ---
+
+  function startHeartbeat() {
+    // Native autonomous mode drives the heartbeat itself; running the web
+    // watchdog too would let a missed pong close the native-owned socket.
+    if (isNativeAccountSocketMode()) return;
+    stopHeartbeat();
+    lastPongAt = Date.now();
+    heartbeatTimer = setInterval(() => {
+      if (!wsConn || wsConn.readyState !== WebSocket.OPEN) return;
+      if (lastPongAt && Date.now() - lastPongAt > HEARTBEAT_TIMEOUT) {
+        log({ wsHeartbeatTimeout: true, elapsed: Date.now() - lastPongAt });
+        try { wsConn.close(); } catch { }
+        return;  // onclose will trigger reconnect
+      }
+      lastPingSentAt = Date.now();
+      try { wsConn.send(JSON.stringify({ type: 'ping' })); } catch { }
+    }, HEARTBEAT_INTERVAL);
+  }
+
+  function stopHeartbeat() {
+    if (heartbeatTimer) {
+      clearInterval(heartbeatTimer);
+      heartbeatTimer = null;
+    }
+  }
+
+  // --- Close / Cleanup (for secureLogout) ---
+
+  function close() {
+    try { wsConn?.close(); } catch { }
+    wsConn = null;
+    wsAuthTokenInfo = null;
+    connecting = false;
+    reconnectAttempts = 0;
+    connectStartedAt = 0;
+    if (wsReconnectTimer) {
+      clearTimeout(wsReconnectTimer);
+      wsReconnectTimer = null;
+    }
+    if (connectTimeoutTimer) {
+      clearTimeout(connectTimeoutTimer);
+      connectTimeoutTimer = null;
+    }
+    stopHeartbeat();
+    pendingMessages.length = 0;
+    // Reset RTT state
+    lastPingSentAt = 0;
+    rttSamples.length = 0;
+    lastQuality = 'good';
+  }
+
+  function clearAuth() {
+    wsAuthTokenInfo = null;
+  }
+
+  // --- Message routing helpers ---
+
+  function resolveWsPeer(msg = {}) {
+    return normalizePeerIdentity({
+      peerAccountDigest: msg.peerAccountDigest || msg.fromAccountDigest || null
+    });
+  }
+
+  function isTargetingThisDevice(msg = {}) {
+    const targetDeviceId = msg.targetDeviceId || null;
+    if (!targetDeviceId) return true;
+    const selfDeviceId = typeof getDeviceId === 'function' ? (getDeviceId() || ensureDeviceId()) : null;
+    if (!selfDeviceId) return false;
+    return String(targetDeviceId).trim() === String(selfDeviceId).trim();
+  }
+
+  function isForensicsWsSecureMessage(type) {
+    return type === 'secure-message' || type === 'message-new';
+  }
+
+  function buildForensicsSummary(msg = {}) {
+    const conversationId = String(msg?.conversationId || msg?.conversation_id || '').trim() || null;
+    const messageId = msg?.messageId || msg?.message_id || msg?.id || null;
+    const serverMessageId = msg?.serverMessageId || msg?.server_message_id || null;
+    const senderDeviceId = msg?.senderDeviceId || msg?.sender_device_id || null;
+    const targetDeviceId = msg?.targetDeviceId || msg?.target_device_id || null;
+    const msgType = msg?.msgType || msg?.msg_type || msg?.type || null;
+    const ts = msg?.ts ?? msg?.timestamp ?? msg?.createdAt ?? msg?.created_at ?? null;
+    return { conversationId, messageId, serverMessageId, senderDeviceId, targetDeviceId, msgType, ts };
+  }
+
+  function normalizeWsToken(value) {
+    if (typeof value !== 'string') return null;
+    const trimmed = value.trim();
+    return trimmed || null;
+  }
+
+  function resolveIncomingPeerIdentity(msg = {}) {
+    return normalizePeerIdentity({
+      peerAccountDigest: msg?.senderAccountDigest
+        || msg?.fromAccountDigest
+        || msg?.sender_account_digest
+        || msg?.senderDigest
+        || msg?.sender_digest
+        || null,
+      peerDeviceId: msg?.senderDeviceId
+        || msg?.sender_device_id
+        || null
+    });
+  }
+
+  function resolveConversationToken({ conversationId, peerAccountDigest, peerDeviceId } = {}) {
+    const convId = typeof conversationId === 'string' ? conversationId.trim() : '';
+    let tokenB64 = null;
+    let resolvedPeerDigest = normalizeAccountDigest(peerAccountDigest || null);
+    let resolvedPeerDeviceId = normalizePeerDeviceId(peerDeviceId || null);
+    if (!convId) {
+      return { tokenB64: null, peerAccountDigest: resolvedPeerDigest || null, peerDeviceId: resolvedPeerDeviceId || null };
+    }
+    const convIndex = sessionStore.conversationIndex instanceof Map ? sessionStore.conversationIndex : null;
+    if (convIndex) {
+      const entry = convIndex.get(convId) || null;
+      const tokenCandidate = normalizeWsToken(entry?.token_b64 || entry?.tokenB64 || entry?.conversationToken || null);
+      if (!tokenB64 && tokenCandidate) tokenB64 = tokenCandidate;
+      if (!resolvedPeerDigest) {
+        resolvedPeerDigest = normalizeAccountDigest(entry?.peerAccountDigest || null);
+      }
+      if (!resolvedPeerDeviceId) {
+        resolvedPeerDeviceId = normalizePeerDeviceId(entry?.peerDeviceId || null);
+      }
+    }
+    const threads = sessionStore.conversationThreads instanceof Map ? sessionStore.conversationThreads : null;
+    if (!tokenB64 && threads) {
+      const entry = threads.get(convId) || null;
+      const tokenCandidate = normalizeWsToken(entry?.conversationToken || entry?.token_b64 || entry?.tokenB64 || null);
+      if (!tokenB64 && tokenCandidate) tokenB64 = tokenCandidate;
+      if (!resolvedPeerDigest) {
+        resolvedPeerDigest = normalizeAccountDigest(entry?.peerAccountDigest || null);
+      }
+      if (!resolvedPeerDeviceId) {
+        resolvedPeerDeviceId = normalizePeerDeviceId(entry?.peerDeviceId || null);
+      }
+    }
+    if (!tokenB64 && resolvedPeerDigest) {
+      const secret = getContactSecret(resolvedPeerDigest, { peerDeviceId: resolvedPeerDeviceId });
+      const tokenCandidate = normalizeWsToken(secret?.conversationToken || secret?.conversation?.token || null);
+      if (!tokenB64 && tokenCandidate) tokenB64 = tokenCandidate;
+      if (!resolvedPeerDeviceId) {
+        resolvedPeerDeviceId = normalizePeerDeviceId(secret?.peerDeviceId || null);
+      }
+    }
+    return {
+      tokenB64: tokenB64 || null,
+      peerAccountDigest: resolvedPeerDigest || null,
+      peerDeviceId: resolvedPeerDeviceId || null
+    };
+  }
+
+  function buildLiveJobContext(msg = {}, convId = null) {
+    const conversationId = typeof convId === 'string' ? convId.trim() : '';
+    const peerIdentity = resolveIncomingPeerIdentity(msg);
+    const tokenInfo = resolveConversationToken({
+      conversationId,
+      peerAccountDigest: peerIdentity.accountDigest,
+      peerDeviceId: peerIdentity.deviceId
+    });
+    return {
+      conversationId: conversationId || null,
+      tokenB64: tokenInfo.tokenB64 || null,
+      peerAccountDigest: tokenInfo.peerAccountDigest || peerIdentity.accountDigest || null,
+      peerDeviceId: tokenInfo.peerDeviceId || peerIdentity.deviceId || null,
+      messageId: msg?.messageId || msg?.message_id || msg?.id || null,
+      serverMessageId: msg?.serverMessageId || msg?.server_message_id || msg?.serverMsgId || null,
+      sourceTag: 'ws_incoming'
+    };
+  }
+
+  // --- Incoming message dispatch ---
+
+  async function handleMessage(msg) {
+    const type = msg?.type;
+    if (type === 'hello') return;
+    if (type === 'pong') {
+      const now = Date.now();
+      lastPongAt = now;
+      // RTT measurement — detect degraded network quality
+      if (lastPingSentAt > 0) {
+        const rtt = now - lastPingSentAt;
+        rttSamples.push(rtt);
+        if (rttSamples.length > RTT_WINDOW_SIZE) rttSamples.shift();
+        const avg = rttSamples.reduce((a, b) => a + b, 0) / rttSamples.length;
+        const quality = avg >= RTT_DEGRADED_MS ? 'degraded' : 'good';
+        if (quality !== lastQuality) {
+          lastQuality = quality;
+          updateConnectionIndicator(quality === 'degraded' ? 'degraded' : 'online');
+        }
+      }
+      return;
+    }
+    if (type === 'auth') {
+      if (msg?.ok) updateConnectionIndicator('online');
+      else updateConnectionIndicator('offline');
+      if (msg?.ok) {
+        const pm = getPresenceManager();
+        const mp = getMessagesPane();
+        pm?.sendPresenceSubscribe?.();
+        mp?.refreshAfterReconnect?.();
+        messagesFlowFacade.onLoginResume({
+          source: 'ws_reconnect',
+          runRestore: false,
+          onOfflineDecryptError: (err) => log({ offlineDecryptSyncError: err?.message || err, source: 'ws_reconnect' }),
+          reconcileOutgoingStatus: (params) => messagesFlowFacade.reconcileOutgoingStatusNow({
+            ...params,
+            reconcileOutgoingStatusNow: mp?.reconcileOutgoingStatusNow
+          })
+        });
+        flushOutbox({ sourceTag: 'ws_auth_ok' }).catch(() => { });
+      }
+      return;
+    }
+    if (type === 'force-logout') {
+      const reason = msg?.reason || t('auth.accountCleared');
+      showForcedLogoutModal(reason);
+      secureLogout(reason, { auto: true });
+      return;
+    }
+    if (handleCallSignalMessage(msg) || handleCallAuxMessage(msg)) {
+      return;
+    }
+    if (type === 'contact-removed') {
+      if (!isTargetingThisDevice(msg)) return;
+      const peerDigest = normalizeAccountDigest(msg.peerAccountDigest || msg.fromAccountDigest || '');
+      const peerDevId = normalizePeerDeviceId(msg.senderDeviceId || '');
+      const peerAccountDigest = peerDigest && peerDevId ? `${peerDigest}::${peerDevId}` : peerDigest;
+      if (peerAccountDigest) {
+        try {
+          // Dispatch event (sync) then AWAIT the cleanup (D1 delete + backup)
+          // so persistence is guaranteed before the user can close the tab.
+          document.dispatchEvent(new CustomEvent('contacts:removed', { detail: { peerAccountDigest, notifyPeer: false } }));
+        } catch (err) {
+          log({ contactRemovedEventError: err?.message || err, peerAccountDigest });
+        }
+        // __contactRemovalCleanup is set by contacts-view to expose the
+        // awaitable cleanup promise from removeContactState.
+        try {
+          const cleanup = window.__contactRemovalCleanup;
+          if (cleanup instanceof Promise) await cleanup;
+        } catch {}
+        try {
+          if (typeof window !== 'undefined') window.__refreshContacts?.();
+        } catch {}
+      }
+      return;
+    }
+    if (type === 'conversation-deleted') {
+      if (!isTargetingThisDevice(msg)) return;
+      const conversationId = String(msg?.conversationId || '').trim();
+      const senderDigest = normalizeAccountDigest(
+        msg?.senderAccountDigest || msg?.peerAccountDigest || ''
+      );
+      if (!conversationId) return;
+      let clearTimestamp = Number(msg?.clearTimestamp) || 0;
+      if (!clearTimestamp) clearTimestamp = Math.floor(Date.now() / 1000);
+      // Perform local cleanup: set deletion cursor, clear history, update threads
+      (async () => {
+        try {
+          const [{ setDeletionCursor }, { clearConversationHistory }, { appendUserMessage }] = await Promise.all([
+            import('../../features/soft-deletion/deletion-api.js'),
+            import('../../features/messages/cache.js'),
+            import('../../features/timeline-store.js')
+          ]);
+          await setDeletionCursor(conversationId, clearTimestamp).catch(() => {});
+          clearConversationHistory(conversationId, clearTimestamp);
+          // Remove thread from conversation list
+          sessionStore.conversationThreads?.delete?.(conversationId);
+          sessionStore.deletedConversations?.add?.(conversationId);
+          // Append tombstone so the UI shows the deletion marker
+          appendUserMessage(conversationId, {
+            messageId: `tombstone-deleted-${conversationId}`,
+            msgType: 'conversation-deleted',
+            subtype: 'conversation-deleted',
+            text: '',
+            direction: 'incoming',
+            ts: clearTimestamp,
+            tsMs: clearTimestamp * 1000,
+            conversationId,
+            senderDigest: senderDigest || null
+          });
+          // Dispatch DOM event for UI cleanup
+          document.dispatchEvent(new CustomEvent('sentry:conversation-deleted', {
+            detail: { conversationId, clearTimestamp, senderDigest }
+          }));
+          // Refresh conversation list
+          if (typeof window !== 'undefined') window.__refreshContacts?.();
+        } catch (err) {
+          log({ wsConversationDeletedError: err?.message || err, conversationId });
+        }
+      })();
+      return;
+    }
+    if (type === 'invite-delivered') {
+      if (!isTargetingThisDevice(msg)) return;
+      const inviteId = msg?.inviteId || null;
+      if (!inviteId) {
+        log({ inviteDeliveredMissingId: true });
+        return;
+      }
+      getShareController()?.consumeInviteDropbox?.(inviteId, { source: 'ws' })
+        .catch((err) => log({ inviteConsumeError: err?.message || err, inviteId }));
+      return;
+    }
+    if (type === 'contacts-reload') {
+      if (!isTargetingThisDevice(msg)) return;
+      loadInitialContacts()
+        .then(() => hydrateProfileSnapshots())
+        .catch((err) => log({ contactsInitError: err?.message || err }));
+      return;
+    }
+    if (type === 'presence') {
+      const online = Array.isArray(msg?.onlineAccountDigests) ? msg.onlineAccountDigests
+        : Array.isArray(msg?.onlineDigests) ? msg.onlineDigests
+          : Array.isArray(msg?.online_accounts) ? msg.online_accounts
+            : Array.isArray(msg?.online) ? msg.online
+              : [];
+      getPresenceManager()?.applyPresenceSnapshot?.(online);
+      return;
+    }
+    if (type === 'presence-update') {
+      const identity = resolveWsPeer(msg);
+      if (!identity.key) return;
+      getPresenceManager()?.setContactPresence?.(identity, !!msg?.online);
+      return;
+    }
+    if (type === 'vault-ack') {
+      if (!isTargetingThisDevice(msg)) return;
+      getMessagesPane()?.handleVaultAckEvent?.(msg);
+      return;
+    }
+    if (type === 'push-device-paired') {
+      document.dispatchEvent(new CustomEvent('sentry:push-device-paired', { detail: msg }));
+      return;
+    }
+    // ── Buffered message markers (ephemeral DO buffer) ──
+    if (type === 'buffered-messages-start') {
+      log({ wsBufferedMessagesStart: true, ts: msg?.ts });
+      return;
+    }
+    if (type === 'buffered-messages-end') {
+      log({ wsBufferedMessagesEnd: true, count: msg?.count, ts: msg?.ts });
+      return;
+    }
+    // ── Ephemeral chat events ──
+    if (type === 'ephemeral_session_started' || type === 'ephemeral-extended' || type === 'ephemeral-deleted'
+        || type === 'ephemeral-message' || type === 'ephemeral-key-exchange' || type === 'ephemeral-key-exchange-ack'
+        || type === 'ephemeral-guest-leave'
+        || type === 'ephemeral-peer-reconnected' || type === 'ephemeral-peer-disconnected'
+        || type.startsWith('ephemeral-call-')) {
+      const mp = getMessagesPane();
+      console.log('[ws] ephemeral event received:', type, msg?.sessionId?.slice(0, 8) || '',
+        'controller:', !!mp?.ephemeralController);
+      if (!mp?.ephemeralController) {
+        console.warn('[ws] ephemeral event dropped — controller not ready', { type, sessionId: msg?.sessionId?.slice(0, 8) });
+      }
+      const handled = mp?.ephemeralController?.handleWsMessage?.(msg);
+      if (type === 'ephemeral-message' && msg?.conversationId) {
+        // Decrypt and render directly via ephemeral controller.
+        // Cannot use handleIncomingSecureMessage — it requires targetDeviceId/senderDeviceId
+        // which ephemeral WS relay messages don't carry.
+        const ctrl = mp?.ephemeralController;
+        if (ctrl && msg.header && msg.ciphertext_b64) {
+          ctrl.decryptAndRender(msg).catch(err => {
+            console.warn('[ws] ephemeral decrypt failed', err?.message);
+          });
+        }
+      }
+      return;
+    }
+    // ── Business Conversation events ───────────────────────────────
+    if (type === 'biz-conv-message') {
+      const convId = String(msg?.conversation_id || '').trim();
+      if (!convId) return;
+      log({ bizConvMessage: convId.slice(0, 16), sender: msg?.sender_account_digest?.slice(0, 12) });
+      // Dispatch to BizConvStore for decryption and timeline insertion
+      try {
+        const { BizConvStore } = await import('../../features/biz-conv.js');
+        const { appendUserMessage } = await import('../../features/timeline-store.js');
+        const { upsertBizConvThread } = await import('../../features/conversation-updates.js');
+        const state = BizConvStore.get(convId);
+        if (!state) {
+          console.warn('[ws] biz-conv-message: no session for', convId.slice(0, 16));
+          return;
+        }
+        const plaintext = await BizConvStore.decryptMessage(convId, msg);
+        const messageId = msg.message_id || crypto.randomUUID();
+        appendUserMessage(convId, {
+          messageId,
+          msgType: 'biz-conv-text',
+          text: typeof plaintext === 'string' ? plaintext : plaintext?.text || JSON.stringify(plaintext),
+          senderAccountDigest: msg.sender_account_digest,
+          ts: msg.ts || Date.now(),
+          decrypted: true
+        });
+        upsertBizConvThread(convId, {
+          lastMessageText: typeof plaintext === 'string' ? plaintext : plaintext?.text || '',
+          lastMessageTs: msg.ts || Date.now(),
+          lastMessageId: messageId
+        });
+        // 標記備份為 dirty
+        const { markBizConvBackupDirty } = await import('../../features/biz-conv-backup.js');
+        markBizConvBackupDirty();
+      } catch (err) {
+        console.warn('[ws] biz-conv-message decrypt failed', err?.message);
+      }
+      return;
+    }
+    if (type === 'biz-conv-member-changed') {
+      log({ bizConvMemberChanged: msg?.conversation_id?.slice(0, 16), change: msg?.change });
+      try {
+        const { BizConvStore } = await import('../../features/biz-conv.js');
+        const state = BizConvStore.get(msg?.conversation_id);
+        if (state) {
+          state.lastSyncTs = Date.now();
+          // If we are the owner and a member left, trigger key rotation
+          const change = msg?.change || msg?.action;
+          const removedDigest = msg?.account_digest || msg?.target_account_digest;
+          const selfDigest = getAccountDigest();
+          if ((change === 'left' || change === 'removed') && state.owner_account_digest === selfDigest) {
+            try {
+              const { rotateGroupKey } = await import('../../features/biz-conv-key-rotation.js');
+              await rotateGroupKey(msg.conversation_id, {
+                reason: change === 'left' ? 'member-left' : 'member-removed',
+                removedDigest
+              });
+            } catch (rotErr) {
+              log({ bizConvAutoRotateError: rotErr?.message });
+            }
+          }
+        }
+      } catch {}
+      return;
+    }
+    if (type === 'biz-conv-dissolved' || type === 'biz-conv-removed-notification') {
+      const convId = String(msg?.conversation_id || '').trim();
+      const isDissolved = type === 'biz-conv-dissolved';
+      log({ [isDissolved ? 'bizConvDissolved' : 'bizConvRemoved']: convId?.slice(0, 16) });
+      try {
+        const { BizConvStore } = await import('../../features/biz-conv.js');
+        const { getConversationThreads } = await import('../../features/conversation-updates.js');
+        const { markBizConvBackupDirty } = await import('../../features/biz-conv-backup.js');
+
+        // Get group name before removing (for notification)
+        const thread = getConversationThreads().get(convId);
+        const groupName = thread?.bizConvName || BizConvStore.get(convId)?.meta?.name || t('messages.bizConvDefault');
+
+        // Hard-delete from store and threads
+        BizConvStore.remove(convId);
+        getConversationThreads().delete(convId);
+        markBizConvBackupDirty();
+
+        const mp = getMessagesPane();
+        const state = mp?.getMessageState?.();
+
+        // If user is currently viewing this group, kick back to list
+        if (state && state.activeBizConv && state.conversationId === convId) {
+          state.activeBizConv = false;
+          state.conversationId = null;
+          state.viewMode = 'list';
+          mp?.clearMessagesView?.();
+          mp?.renderConversationList?.();
+        } else {
+          mp?.renderConversationList?.();
+        }
+
+        // Show notification via custom event (picked up by toast controller)
+        const msgText = isDissolved
+          ? (t('messages.bizConvDissolvedNotice') || '"{name}" has been dissolved.').replace('{name}', groupName)
+          : (t('messages.bizConvRemovedNotice') || 'You have been removed from "{name}".').replace('{name}', groupName);
+        if (typeof document !== 'undefined') {
+          document.dispatchEvent(new CustomEvent('sentry:toast', { detail: { message: msgText } }));
+        }
+      } catch (err) {
+        log({ bizConvDissolveHandleError: err?.message });
+      }
+      return;
+    }
+    if (type === 'biz-conv-ownership-transferred') {
+      log({ bizConvOwnershipTransferred: msg?.conversation_id?.slice(0, 16), newOwner: msg?.new_owner?.slice(0, 12) });
+      try {
+        const { BizConvStore } = await import('../../features/biz-conv.js');
+        const state = BizConvStore.get(msg?.conversation_id);
+        if (state) state.owner_account_digest = msg?.new_owner;
+      } catch {}
+      return;
+    }
+    if (type === 'biz-conv-policy-updated') {
+      log({ bizConvPolicyUpdated: msg?.conversation_id?.slice(0, 16) });
+      // Policy will be re-fetched on next conversation open
+      return;
+    }
+    if (type === 'biz-conv-key-rotated') {
+      log({ bizConvKeyRotated: msg?.conversation_id?.slice(0, 16), newEpoch: msg?.new_epoch });
+      // Client will receive new KDM via DR session with the updated group_seed
+      return;
+    }
+
+    if (type === 'secure-message' || type === 'message-new') {
+      if (!isTargetingThisDevice(msg)) return;
+      if (!msg?.senderDeviceId || !msg?.targetDeviceId) {
+        log({ secureMessageMissingDeviceId: true, type, hasSender: !!msg?.senderDeviceId, hasTarget: !!msg?.targetDeviceId });
+        return;
+      }
+      const convId = String(msg?.conversationId || msg?.conversation_id || '').trim();
+      if (isSettingsConversationId(convId)) {
+        handleSettingsSecureMessage();
+        return;
+      }
+      if (wsDebugEnabled) {
+        try {
+          console.log('[ws-dispatch]', {
+            type,
+            conversationId: convId || null,
+            senderAccountDigest: msg?.senderAccountDigest || null,
+            senderDeviceId: msg?.senderDeviceId || null,
+            targetDeviceId: msg?.targetDeviceId || null,
+            targetAccountDigest: msg?.targetAccountDigest || null,
+            peerAccountDigest: msg?.peerAccountDigest || null
+          });
+        } catch { }
+      }
+      try {
+        const summary = buildForensicsSummary(msg);
+        logForensicsEvent('WS_DISPATCH', {
+          ...summary,
+          conversationId: convId || summary.conversationId || null,
+          handler: 'messagesPane.handleIncomingSecureMessage'
+        });
+      } catch { }
+      const liveJobCtx = buildLiveJobContext(msg, convId);
+      messagesFlowFacade.onWsIncomingMessageNew({
+        event: msg,
+        handleIncomingSecureMessage: getMessagesPane()?.handleIncomingSecureMessage
+      }, liveJobCtx);
+      return;
+    }
+  }
+
+  return {
+    ensure,
+    send,
+    close,
+    clearAuth,
+    startMonitor,
+    pause,
+    resume
+  };
+}

@@ -1,0 +1,496 @@
+/**
+ * Conversation Threads Management Module
+ * Extracted from messages-pane.js - handles conversation list state and rendering.
+ */
+
+import { log, logCapped } from '../../core/log.js';
+import { normalizeAccountDigest, normalizePeerDeviceId, getAccountDigest as storeGetAccountDigest, getDeviceId as storeGetDeviceId } from '../../core/store.js';
+import {
+    normalizePeerKey,
+    splitPeerKey,
+    upsertContactCore,
+    isCoreVaultReady,
+    resolveReadyContactCoreEntry
+} from './contact-core-store.js';
+import { restorePendingInvites } from './session-store.js';
+import { timelineGetTimeline } from '../../features/timeline-store.js';
+import { messagesFlowFacade } from '../../features/messages-flow-facade.js';
+import { escapeHtml, resolveMessagePreview, updateThreadPreview, formatThreadPreview } from './ui-utils.js';
+import { listSecureMessages } from '../../api/messages.js';
+import { buildDrAadFromHeader } from '../../crypto/dr.js';
+import { b64u8 } from '../../crypto/nacl.js';
+import { toU8Strict } from '/shared/utils/u8-strict.js';
+import { MessageKeyVault } from '../../features/message-key-vault.js';
+import { t } from '/locales/index.js';
+
+/**
+ * Create conversation threads manager.
+ * @param {Object} deps - Dependencies
+ * @param {Object} deps.sessionStore - Session store reference
+ * @param {Function} deps.getMessageState - Message state getter
+ * @param {Function} deps.logContactCoreWriteSkip - Contact core logging helper
+ * @param {Function} deps.logReplayCallsite - Replay callsite logger
+ * @param {Function} deps.logReplayGateTrace - Replay gate trace logger
+ * @param {Function} deps.logReplayFetchResult - Replay fetch result logger
+ * @returns {Object} Thread manager methods
+ */
+export function createConversationThreadsManager(deps) {
+    const {
+        sessionStore,
+        getMessageState,
+        logContactCoreWriteSkip,
+        logReplayCallsite,
+        logReplayGateTrace,
+        logReplayFetchResult
+    } = deps;
+
+    let conversationIndexRestoredFromPending = false;
+
+    function ensurePeerAccountDigest(source) {
+        if (!source || typeof source !== 'object') return null;
+        if (source.peerAccountDigest) {
+            source.peerAccountDigest = normalizePeerKey(source.peerAccountDigest);
+            return source.peerAccountDigest || null;
+        }
+        return null;
+    }
+
+    function threadPeer(thread) {
+        if (!thread) return null;
+        return normalizePeerKey(thread.peerAccountDigest ?? thread);
+    }
+
+    function ensureConversationIndex() {
+        if (!(sessionStore.conversationIndex instanceof Map)) {
+            const entries = sessionStore.conversationIndex && typeof sessionStore.conversationIndex.entries === 'function'
+                ? Array.from(sessionStore.conversationIndex.entries())
+                : [];
+            sessionStore.conversationIndex = new Map(entries);
+        }
+        if (!conversationIndexRestoredFromPending) {
+            conversationIndexRestoredFromPending = true;
+            const pendingInvites = restorePendingInvites();
+            const nowSec = Date.now();
+            let restoredCount = 0;
+            const sampleConversationIdsPrefix8 = [];
+            if (pendingInvites instanceof Map) {
+                for (const entry of pendingInvites.values()) {
+                    const expiresAt = Number(entry?.expiresAt || 0);
+                    if (!Number.isFinite(expiresAt) || expiresAt <= nowSec) continue;
+                    const conversationId = typeof entry?.conversationId === 'string' ? entry.conversationId.trim() : '';
+                    const conversationToken = typeof entry?.conversationToken === 'string' ? entry.conversationToken.trim() : '';
+                    if (!conversationId || !conversationToken) continue;
+                    const ownerAccountDigest = normalizeAccountDigest(entry?.ownerAccountDigest || null);
+                    const ownerDeviceId = normalizePeerDeviceId(entry?.ownerDeviceId || null);
+                    const prev = sessionStore.conversationIndex.get(conversationId) || {};
+                    const next = { ...prev };
+                    let changed = false;
+                    if (!prev.token_b64) {
+                        next.token_b64 = conversationToken;
+                        changed = true;
+                    }
+                    if (!prev.peerAccountDigest && ownerAccountDigest) {
+                        next.peerAccountDigest = ownerAccountDigest;
+                        changed = true;
+                    }
+                    if (!prev.peerDeviceId && ownerDeviceId) {
+                        next.peerDeviceId = ownerDeviceId;
+                        changed = true;
+                    }
+                    if (!changed) continue;
+                    sessionStore.conversationIndex.set(conversationId, next);
+                    restoredCount += 1;
+                    if (sampleConversationIdsPrefix8.length < 3) {
+                        sampleConversationIdsPrefix8.push(conversationId.slice(0, 8));
+                    }
+                }
+            }
+            logCapped('conversationIndexRestoredFromPending', {
+                restoredCount,
+                sampleConversationIdsPrefix8,
+                source: 'pendingInvites'
+            }, 5);
+        }
+        return sessionStore.conversationIndex;
+    }
+
+    function getConversationThreads() {
+        if (!(sessionStore.conversationThreads instanceof Map)) {
+            const entries = sessionStore.conversationThreads && typeof sessionStore.conversationThreads.entries === 'function'
+                ? Array.from(sessionStore.conversationThreads.entries())
+                : [];
+            sessionStore.conversationThreads = new Map(entries);
+        }
+        return sessionStore.conversationThreads;
+    }
+
+    function upsertConversationThread({ peerAccountDigest, peerDeviceId = null, conversationId, tokenB64, nickname, avatar }) {
+        const key = normalizePeerKey(peerAccountDigest);
+        const convId = String(conversationId || '').trim();
+        if (!key || !convId) return null;
+        if (sessionStore.deletedConversations?.has?.(convId)) return null;
+        const threads = getConversationThreads();
+        const prev = threads.get(convId) || {};
+        const { digest: digestFromKey, deviceId: deviceFromKey } = splitPeerKey(key);
+        const resolvedPeerDeviceId = normalizePeerDeviceId(peerDeviceId || deviceFromKey || prev.peerDeviceId || null);
+        const resolvedToken = tokenB64 || prev.conversationToken || null;
+        if (!resolvedPeerDeviceId || !resolvedToken) {
+            try { log({ conversationThreadSkip: { convId, peerAccountDigest: key, reason: 'missing-core' } }); } catch { }
+            return prev || null;
+        }
+        if (!digestFromKey) {
+            logContactCoreWriteSkip?.({
+                callsite: 'conversation-threads:thread-upsert',
+                conversationId: convId,
+                hasDeviceId: !!resolvedPeerDeviceId
+            });
+            return prev || null;
+        }
+        upsertContactCore({
+            peerAccountDigest: digestFromKey,
+            peerDeviceId: resolvedPeerDeviceId,
+            conversationId: convId,
+            conversationToken: resolvedToken,
+            nickname: nickname || null,
+            avatar: avatar || null
+        }, 'conversation-threads:thread-upsert');
+        const entry = {
+            ...prev,
+            peerAccountDigest: key,
+            peerDeviceId: resolvedPeerDeviceId,
+            conversationId: convId,
+            conversationToken: resolvedToken,
+            nickname: nickname || prev.nickname || null,
+            avatar: avatar || prev.avatar || null,
+            lastMessageText: typeof prev.lastMessageText === 'string' ? prev.lastMessageText : '',
+            lastMessageTs: typeof prev.lastMessageTs === 'number' ? prev.lastMessageTs : null,
+            lastMessageId: prev.lastMessageId || null,
+            lastMsgType: prev.lastMsgType || null,
+            lastReadTs: typeof prev.lastReadTs === 'number' ? prev.lastReadTs : null,
+            unreadCount: typeof prev.unreadCount === 'number' ? prev.unreadCount : 0,
+            previewLoaded: !!prev.previewLoaded,
+            needsRefresh: !!prev.needsRefresh
+        };
+        threads.set(convId, entry);
+        return entry;
+    }
+
+    function resolveTargetDeviceForConv(conversationId, peerAccountDigest = null) {
+        const convId = String(conversationId || '').trim();
+        if (!convId) return null;
+        const threads = getConversationThreads();
+        const thread = threads.get(convId) || null;
+        if (thread?.peerDeviceId) return thread.peerDeviceId;
+        const convIndex = ensureConversationIndex();
+        const convEntry = convIndex.get(convId) || null;
+        if (convEntry?.peerDeviceId) return convEntry.peerDeviceId;
+        if (convEntry?.peerAccountDigest && peerAccountDigest && convEntry.peerAccountDigest !== peerAccountDigest) {
+            return null;
+        }
+        const state = getMessageState();
+        if (state.activePeerDigest && (!peerAccountDigest || state.activePeerDigest === peerAccountDigest)) {
+            if (state.activePeerDeviceId) return state.activePeerDeviceId;
+        }
+        return null;
+    }
+
+    function syncConversationThreadsFromContacts() {
+        const threads = getConversationThreads();
+        const contacts = Array.isArray(sessionStore.contactState) ? sessionStore.contactState : [];
+        const seen = new Set();
+        for (const contact of contacts) {
+            const peerDigest = ensurePeerAccountDigest(contact);
+            const conversationId = contact?.conversation?.conversation_id;
+            const tokenB64 = contact?.conversation?.token_b64;
+            const peerDeviceId = contact?.conversation?.peerDeviceId || null;
+            if (!peerDigest || !conversationId || !tokenB64) continue;
+            seen.add(conversationId);
+            upsertConversationThread({
+                peerAccountDigest: peerDigest,
+                peerDeviceId,
+                conversationId,
+                tokenB64,
+                nickname: contact.nickname,
+                avatar: contact.avatar || null
+            });
+        }
+        for (const convId of Array.from(threads.keys())) {
+            const thread = threads.get(convId);
+            if (!seen.has(convId) && thread?.type !== 'biz-conv') threads.delete(convId);
+        }
+        return threads;
+    }
+
+    /**
+     * Decrypt a single message using a server-provided vault key.
+     * Mirrors the logic in vault-replay.js decryptWithMessageKey.
+     */
+    async function _decryptPreviewMessage(messageKeyB64, ivB64, ciphertextB64, header) {
+        if (!messageKeyB64 || !ivB64 || !ciphertextB64) return null;
+        const keyU8 = toU8Strict(b64u8(messageKeyB64), 'conversation-threads:preview-decrypt');
+        const ivU8 = b64u8(ivB64);
+        const ctU8 = b64u8(ciphertextB64);
+        const key = await crypto.subtle.importKey('raw', keyU8, 'AES-GCM', false, ['decrypt']);
+        const aad = header && typeof buildDrAadFromHeader === 'function'
+            ? buildDrAadFromHeader(header)
+            : null;
+        const params = aad
+            ? { name: 'AES-GCM', iv: ivU8, additionalData: aad }
+            : { name: 'AES-GCM', iv: ivU8 };
+        try {
+            const ptBuf = await crypto.subtle.decrypt(params, key, ctU8);
+            return new TextDecoder().decode(ptBuf);
+        } catch (firstErr) {
+            // Fallback: retry with opposite AAD for pre-M-4 messages
+            const fallbackParams = aad
+                ? { name: 'AES-GCM', iv: ivU8 }
+                : { name: 'AES-GCM', iv: ivU8, additionalData: buildDrAadFromHeader(header) };
+            try {
+                const ptBuf = await crypto.subtle.decrypt(fallbackParams, key, ctU8);
+                return new TextDecoder().decode(ptBuf);
+            } catch {
+                throw firstErr;
+            }
+        }
+    }
+
+    /**
+     * Resolve direction of a message relative to self.
+     */
+    function _resolvePreviewDirection(item, header, selfDeviceId, selfDigest) {
+        const senderDeviceId = item?.sender_device_id || item?.senderDeviceId || header?.device_id || header?.meta?.sender_device_id || null;
+        const targetDeviceId = item?.receiver_device_id || item?.receiverDeviceId || header?.meta?.receiver_device_id || null;
+        const senderDigestRaw = item?.sender_account_digest || item?.senderAccountDigest || header?.meta?.sender_digest || null;
+        const senderDigest = senderDigestRaw ? String(senderDigestRaw).toUpperCase() : null;
+
+        if (targetDeviceId && selfDeviceId && targetDeviceId === selfDeviceId) return 'incoming';
+        if (senderDeviceId && selfDeviceId && senderDeviceId === selfDeviceId) return 'outgoing';
+        if (senderDigest && selfDigest && senderDigest === selfDigest) return 'outgoing';
+        return 'incoming';
+    }
+
+    async function refreshConversationPreviews({ force = false, renderCallback } = {}) {
+        const threadsMap = getConversationThreads();
+        const threads = Array.from(threadsMap.values());
+        const selfDeviceId = storeGetDeviceId();
+        const selfDigest = storeGetAccountDigest();
+        const tasks = [];
+        for (const thread of threads) {
+            // Biz-conv threads: fetch latest message and decrypt via BizConvStore
+            if (thread?.type === 'biz-conv' && thread?.conversationId) {
+                if (!force && thread.previewLoaded && !thread.needsRefresh) continue;
+                tasks.push((async () => {
+                    try {
+                        const { r, data } = await listSecureMessages({
+                            conversationId: thread.conversationId,
+                            limit: 1,
+                            includeKeys: false
+                        });
+                        if (!r?.ok) return;
+                        const items = Array.isArray(data?.items) ? data.items : [];
+                        if (!items.length) {
+                            thread.previewLoaded = true;
+                            return;
+                        }
+                        const latest = items[0];
+                        let header = latest.header || null;
+                        if (!header && typeof latest.header_json === 'string') {
+                            try { header = JSON.parse(latest.header_json); } catch { }
+                        }
+                        const tsRaw = latest.created_at ?? latest.createdAt ?? latest.ts ?? null;
+                        const ts = Number.isFinite(Number(tsRaw)) ? Number(tsRaw) : null;
+                        const messageId = latest.id || latest.messageId || latest.message_id || null;
+                        const senderDigest = latest.sender_account_digest || latest.senderAccountDigest || '';
+                        const isSelf = selfDigest && senderDigest && senderDigest.toUpperCase() === selfDigest.toUpperCase();
+                        const direction = isSelf ? 'outgoing' : 'incoming';
+
+                        // Try to decrypt using BizConvStore
+                        let rawText = null;
+                        if (header?.type === 'biz-conv-message') {
+                            try {
+                                const { BizConvStore } = await import('../../features/biz-conv.js');
+                                const state = BizConvStore.get(thread.conversationId);
+                                if (state) {
+                                    const envelope = {
+                                        epoch: header.epoch,
+                                        sender_device_id: header.sender_device_id,
+                                        counter: header.counter,
+                                        iv_b64: header.iv_b64,
+                                        ciphertext_b64: header.ciphertext_b64
+                                    };
+                                    const plaintext = await BizConvStore.decryptMessage(thread.conversationId, envelope);
+                                    rawText = typeof plaintext === 'string' ? plaintext : (plaintext?.text || null);
+                                    // [FIX] Decrypting the preview ratchets the sender chain forward.
+                                    // Mark backup dirty so the advanced chain state is persisted;
+                                    // otherwise the same message is re-decrypted on every login,
+                                    // and chain state diverges from backup.
+                                    try {
+                                        const { markBizConvBackupDirty } = await import('../../features/biz-conv-backup.js');
+                                        markBizConvBackupDirty();
+                                    } catch { /* best effort */ }
+                                }
+                            } catch { /* decrypt failed */ }
+                        }
+
+                        const text = rawText && typeof rawText === 'string' && rawText.trim()
+                            ? resolveMessagePreview({ text: rawText, msgType: 'biz-conv-text' })
+                            : '';
+                        updateThreadPreview(thread, { text, ts, messageId, direction, msgType: 'biz-conv-text' });
+                    } catch (err) {
+                        log({ bizConvPreviewError: err?.message, conversationId: thread?.conversationId });
+                    } finally {
+                        thread.previewLoaded = true;
+                        thread.needsRefresh = false;
+                    }
+                })());
+                continue;
+            }
+
+            const peerDigest = threadPeer(thread);
+            if (!thread?.conversationId || !thread?.conversationToken || !peerDigest || !thread?.peerDeviceId) {
+                if (!thread?.peerDeviceId) {
+                    try { log({ previewSkipMissingPeerDevice: thread?.conversationId || null }); } catch { }
+                }
+                continue;
+            }
+            if (!force && thread.previewLoaded && !thread.needsRefresh) continue;
+            tasks.push((async () => {
+                try {
+                    // Lightweight fetch: only 1 message with vault keys
+                    const { r, data } = await listSecureMessages({
+                        conversationId: thread.conversationId,
+                        limit: 1,
+                        includeKeys: true
+                    });
+                    if (!r?.ok) {
+                        updateThreadPreview(thread, { text: t('messages.loadFailed') });
+                        return;
+                    }
+                    const items = Array.isArray(data?.items) ? data.items : [];
+                    if (!items.length) {
+                        const preservedType = thread.lastMsgType === 'conversation-deleted' ? 'conversation-deleted' : null;
+                        updateThreadPreview(thread, { text: '', ts: null, messageId: null, direction: null, msgType: preservedType }, { force: true });
+                        thread.unreadCount = 0;
+                        return;
+                    }
+                    const latest = items[0];
+                    const serverKeys = data?.keys || null;
+                    const messageId = latest.id || latest.messageId || latest.message_id || null;
+
+                    // Parse header
+                    let header = latest.header || null;
+                    if (!header && typeof latest.header_json === 'string') {
+                        try { header = JSON.parse(latest.header_json); } catch { }
+                    }
+
+                    // Resolve direction
+                    const direction = _resolvePreviewDirection(latest, header, selfDeviceId, selfDigest);
+
+                    // Resolve message type from header
+                    const msgType = header?.meta?.msg_type || header?.meta?.msgType || 'text';
+
+                    // Resolve timestamp
+                    const tsRaw = latest.created_at ?? latest.createdAt ?? latest.ts ?? null;
+                    const ts = Number.isFinite(Number(tsRaw)) ? Number(tsRaw) : null;
+
+                    // Try to find vault key for this message
+                    const vaultEntry = messageId && serverKeys ? serverKeys[messageId] : null;
+                    const ciphertextB64 = latest.ciphertext_b64 || latest.ciphertextB64 || null;
+                    const ivB64 = header?.iv_b64 || null;
+                    const senderDeviceId = latest.sender_device_id || latest.senderDeviceId || header?.meta?.sender_device_id || null;
+
+                    // Unwrap the server-provided wrapped key via MessageKeyVault
+                    let messageKeyB64 = null;
+                    if (vaultEntry?.wrapped_mk_json && messageId && senderDeviceId) {
+                        try {
+                            const vaultResult = await MessageKeyVault.getMessageKey({
+                                conversationId: thread.conversationId,
+                                messageId,
+                                senderDeviceId,
+                                serverWrappedMk: vaultEntry.wrapped_mk_json,
+                                serverWrapContext: vaultEntry.wrap_context_json,
+                                serverDrStateSnapshot: vaultEntry.dr_state_snapshot
+                            });
+                            if (vaultResult?.ok && vaultResult.messageKeyB64) {
+                                messageKeyB64 = vaultResult.messageKeyB64;
+                            }
+                        } catch (err) {
+                            log({ previewVaultUnwrapFailed: err?.message, conversationId: thread.conversationId });
+                        }
+                    }
+
+                    let rawText = null;
+                    if (messageKeyB64 && ciphertextB64 && ivB64) {
+                        try {
+                            rawText = await _decryptPreviewMessage(messageKeyB64, ivB64, ciphertextB64, header);
+                        } catch (err) {
+                            log({ previewDecryptFailed: err?.message, conversationId: thread.conversationId });
+                            rawText = null;
+                        }
+                    }
+
+                    let text;
+                    if (msgType === 'conversation-deleted') {
+                        text = t('messages.noMessages');
+                        updateThreadPreview(thread, { text, ts, messageId, direction, msgType: 'conversation-deleted' }, { force: true });
+                        thread.unreadCount = 0;
+                        thread.offlineUnreadCount = 0;
+                        return;
+                    }
+
+                    if (rawText && typeof rawText === 'string' && rawText.trim()) {
+                        text = resolveMessagePreview({ text: rawText, msgType });
+                    } else {
+                        text = t('messages.notDecrypted');
+                    }
+
+                    const updated = updateThreadPreview(thread, { text, ts, messageId, direction, msgType });
+                    if (!updated) return;
+
+                    if (thread.lastReadTs === null || thread.lastReadTs === undefined) {
+                        thread.lastReadTs = ts;
+                        thread.unreadCount = 0;
+                    }
+                } catch (err) {
+                    updateThreadPreview(thread, { text: t('messages.loadFailed') });
+                    log({ conversationPreviewError: err?.message || err, conversationId: thread?.conversationId });
+                } finally {
+                    thread.needsRefresh = false;
+                }
+            })());
+        }
+
+        if (!tasks.length) {
+            if (force) renderCallback?.();
+            return;
+        }
+
+        await Promise.allSettled(tasks);
+        renderCallback?.();
+    }
+
+    function getThreadsForRender() {
+        return Array.from(getConversationThreads().values())
+            .filter((thread) => thread?.conversationId
+                && (thread.type === 'biz-conv' || threadPeer(thread))
+                && thread.lastMsgType !== 'conversation-deleted')
+            .sort((a, b) => (b.lastMessageTs || 0) - (a.lastMessageTs || 0));
+    }
+
+    function computeTotalUnread() {
+        return getThreadsForRender().reduce((sum, thread) => sum + Number(thread.unreadCount || 0), 0);
+    }
+
+    return {
+        ensureConversationIndex,
+        getConversationThreads,
+        upsertConversationThread,
+        resolveTargetDeviceForConv,
+        syncConversationThreadsFromContacts,
+        refreshConversationPreviews,
+        getThreadsForRender,
+        computeTotalUnread,
+        threadPeer,
+        ensurePeerAccountDigest
+    };
+}

@@ -1,0 +1,19 @@
+{
+  "name": "message-web",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "node build.mjs",
+    "build:raw": "cp -r src dist",
+    "verify": "node scripts/verify-build.mjs",
+    "verify:cdn": "node scripts/verify-build.mjs --check-cdn --verbose",
+    "preview": "wrangler pages dev ./src"
+  },
+  "dependencies": {
+    "libsodium-wrappers-sumo": "^0.8.4"
+  },
+  "devDependencies": {
+    "esbuild": "^0.24.0",
+    "lucide-static": "^0.577.0"
+  }
+}

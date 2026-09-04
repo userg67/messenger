@@ -1,0 +1,102 @@
+name: SentryMessenger
+options:
+  bundleIdPrefix: red.sentry
+  deploymentTarget:
+    iOS: "16.0"
+  createIntermediateGroups: true
+  groupSortPosition: top
+
+# Native WebRTC call path (mid-term migration — see
+# docs/native-webrtc-migration-plan.md). Linked into the FULL app only (not the
+# App Clip). Gated at runtime by Info.plist `UseNativeCalls` (default false).
+# NOTE: stasel/WebRTC publishes a major version per Chromium milestone; if SPM
+# resolution fails in Xcode, bump this to a version that resolves for you.
+packages:
+  WebRTC:
+    url: https://github.com/stasel/WebRTC
+    from: "120.0.0"
+
+settings:
+  base:
+    MARKETING_VERSION: "1.0.0"
+    CURRENT_PROJECT_VERSION: "1"
+    SWIFT_VERSION: "5.9"
+    DEVELOPMENT_TEAM: HW8N8C46HG   # Matches the appID in the hosted AASA
+    CODE_SIGN_STYLE: Automatic
+
+targets:
+  # ── Full app ──────────────────────────────────────────────────────
+  SentryMessenger:
+    type: application
+    platform: iOS
+    sources:
+      - path: SentryMessenger
+      # SharedKeychain is also compiled into the Notification Service Extension
+      # (the app writes the push-preview key, the NSE reads it). Single source.
+      - path: SentryMessengerNotify/SharedKeychain.swift
+      # Embedded web bundle (folder reference preserves nested structure).
+      # Populated by scripts/bundle-web.sh; optional so an empty/absent folder
+      # doesn't fail generation when building in remote (non-bundled) mode.
+      - path: WebApp
+        type: folder
+        buildPhase: resources
+        optional: true
+    dependencies:
+      - target: SentryMessengerClip
+        embed: true             # "Embed App Clips" copy phase
+      - target: SentryMessengerNotify
+        embed: true             # "Embed App Extensions" (PlugIns)
+      - package: WebRTC         # native call media layer (full app only)
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: red.sentry.messenger
+        PRODUCT_NAME: SentryMessenger
+        GENERATE_INFOPLIST_FILE: NO
+        INFOPLIST_FILE: SentryMessenger/Resources/Info.plist
+        CODE_SIGN_ENTITLEMENTS: SentryMessenger/Resources/SentryMessenger.entitlements
+        TARGETED_DEVICE_FAMILY: "1,2"
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
+        ENABLE_USER_SCRIPT_SANDBOXING: YES
+    scheme: {}
+
+  # ── Notification Service Extension (decrypt E2E push previews) ─────
+  # Decrypts the `encrypted_preview` ciphertext in APNs payloads (P-256 ECDH +
+  # HKDF-SHA256 + AES-256-GCM via CryptoKit) so message notifications show the
+  # real sender + text while the app isn't running. Reads the device's
+  # push-preview private key from the shared Keychain group. Full app only.
+  SentryMessengerNotify:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: SentryMessengerNotify
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: red.sentry.messenger.Notify
+        PRODUCT_NAME: SentryMessengerNotify
+        GENERATE_INFOPLIST_FILE: NO
+        INFOPLIST_FILE: SentryMessengerNotify/Info.plist
+        CODE_SIGN_ENTITLEMENTS: SentryMessengerNotify/SentryMessengerNotify.entitlements
+        TARGETED_DEVICE_FAMILY: "1,2"
+        ENABLE_USER_SCRIPT_SANDBOXING: YES
+    scheme: {}
+
+  # ── App Clip (entry point #2, partial) ────────────────────────────
+  SentryMessengerClip:
+    type: application.on-demand-install-capable
+    platform: iOS
+    sources:
+      - path: SentryMessengerClip
+      - path: SentryMessenger/Shared    # reuse WebView / NFC / bridge / login
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: red.sentry.messenger.Clip
+        PRODUCT_NAME: SentryMessengerClip
+        GENERATE_INFOPLIST_FILE: NO
+        INFOPLIST_FILE: SentryMessengerClip/Resources/Info.plist
+        CODE_SIGN_ENTITLEMENTS: SentryMessengerClip/Resources/SentryMessengerClip.entitlements
+        TARGETED_DEVICE_FAMILY: "1,2"
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
+        ENABLE_USER_SCRIPT_SANDBOXING: YES
+    scheme: {}

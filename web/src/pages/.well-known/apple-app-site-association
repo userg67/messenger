@@ -1,0 +1,11 @@
+{
+  "applinks": {
+    "apps": [],
+    "details": [
+      {
+        "appID": "HW8N8C46HG.red.sentry.messenger",
+        "paths": [ "*" ]
+      }
+    ]
+  }
+}

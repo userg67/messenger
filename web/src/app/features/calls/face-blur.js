@@ -1,0 +1,705 @@
+/**
+ * Face Blur Pipeline — Cross-browser
+ * (Chrome, Edge, Safari, iOS Safari, Firefox)
+ *
+ * Intercepts a camera VideoTrack, draws each frame through a <canvas>,
+ * detects faces, applies pixelation mosaic over detected regions,
+ * and outputs a processed VideoTrack via canvas.captureStream().
+ *
+ * Face detection strategy (three tiers):
+ *   1. Native FaceDetector API (Chrome 86+, Edge 86+) — instant, no network
+ *   2. MediaPipe Face Detection via CDN (Safari, iOS Safari, Firefox)
+ *      — WASM + WebGL, loaded in background on first pipeline creation
+ *   3. Skin-color region detector (last resort if CDN load fails)
+ *
+ * Pipeline:
+ *   Camera VideoTrack → hidden <video> → Canvas drawImage
+ *   → detect faces → pixelate regions → canvas.captureStream()
+ *   → processed VideoTrack → replaceTrack on RTCRtpSender
+ */
+
+import { log } from '../../core/log.js';
+
+/** Blur mode constants */
+export const BLUR_MODE = { FACE: 'face', BACKGROUND: 'background', OFF: 'off' };
+
+const TARGET_FPS = 30;
+const DETECT_INTERVAL_MS = 200;
+const PIXEL_BLOCK = 28;
+
+// ──────────────────────────────────────────────────────────────
+// Tier 1: Native FaceDetector (Chrome / Edge)
+// ──────────────────────────────────────────────────────────────
+
+let nativeDetector = null;
+let nativeSupported = null;
+
+function getNativeDetector() {
+  if (nativeSupported === false) return null;
+  if (nativeDetector) return nativeDetector;
+  if (typeof globalThis.FaceDetector === 'undefined') {
+    nativeSupported = false;
+    return null;
+  }
+  try {
+    nativeDetector = new globalThis.FaceDetector({ fastMode: true, maxDetectedFaces: 5 });
+    nativeSupported = true;
+    return nativeDetector;
+  } catch {
+    nativeSupported = false;
+    return null;
+  }
+}
+
+// ──────────────────────────────────────────────────────────────
+// Tier 2: MediaPipe Face Detection (CDN — all browsers)
+// ──────────────────────────────────────────────────────────────
+// Uses @mediapipe/tasks-vision loaded dynamically from jsDelivr.
+// The WASM runtime + BlazeFace model (~1.5 MB total) are fetched
+// once and cached by the browser. Loading happens in the
+// background; skin-color detection is used in the interim.
+
+const MP_VERSION = '0.10.14';
+const MP_CDN = '/assets/libs/mediapipe';
+const MP_MODEL = '/assets/libs/mediapipe/models/blaze_face_short_range.tflite';
+const MP_LOAD_TIMEOUT_MS = 20_000;
+
+let mpDetector = null;
+let mpReady = false;
+let mpFailed = false;
+let mpLoadPromise = null;
+
+function startMediaPipeLoad() {
+  if (nativeSupported === true || mpReady || mpFailed || mpLoadPromise) return;
+  mpLoadPromise = (async () => {
+    try {
+      // Race against timeout
+      const result = await Promise.race([
+        (async () => {
+          const { FilesetResolver, FaceDetector } = await import(
+            /* webpackIgnore: true */ `${MP_CDN}/vision_bundle.mjs`
+          );
+          const vision = await FilesetResolver.forVisionTasks(`${MP_CDN}/wasm`);
+          return FaceDetector.createFromOptions(vision, {
+            baseOptions: {
+              modelAssetPath: MP_MODEL,
+              delegate: 'GPU'
+            },
+            runningMode: 'VIDEO'
+          });
+        })(),
+        new Promise((_, reject) =>
+          setTimeout(() => reject(new Error('timeout')), MP_LOAD_TIMEOUT_MS)
+        )
+      ]);
+      mpDetector = result;
+      mpReady = true;
+      log({ mediaPipe: 'face detector loaded', version: MP_VERSION });
+    } catch (err) {
+      mpFailed = true;
+      log({ mediaPipeLoadError: err?.message || err });
+    }
+    mpLoadPromise = null;
+  })();
+}
+
+// ──────────────────────────────────────────────────────────────
+// Tier 3: Skin-color region detector (offline / CDN-fail fallback)
+// ──────────────────────────────────────────────────────────────
+// Downscales the frame, classifies pixels as skin using YCbCr
+// thresholds, clusters skin blocks via connected-component
+// labeling, and returns bounding boxes for face-like regions.
+
+const ANALYSIS_W = 160;
+const ANALYSIS_H = 120;
+const GRID = 8;
+const SKIN_CELL_RATIO = 0.32;
+const MIN_COMPONENT_CELLS = 6;
+const MIN_ASPECT = 0.45;
+const MAX_ASPECT = 2.2;
+
+class SkinFaceDetector {
+  constructor() {
+    this._canvas = document.createElement('canvas');
+    this._canvas.width = ANALYSIS_W;
+    this._canvas.height = ANALYSIS_H;
+    this._ctx = this._canvas.getContext('2d', { willReadFrequently: true });
+    this._gw = Math.ceil(ANALYSIS_W / GRID);
+    this._gh = Math.ceil(ANALYSIS_H / GRID);
+  }
+
+  async detect(source) {
+    const ctx = this._ctx;
+    const cw = ANALYSIS_W;
+    const ch = ANALYSIS_H;
+
+    try { ctx.drawImage(source, 0, 0, cw, ch); } catch { return []; }
+
+    let imageData;
+    try { imageData = ctx.getImageData(0, 0, cw, ch); } catch { return []; }
+
+    const data = imageData.data;
+    const gw = this._gw;
+    const gh = this._gh;
+
+    // Build skin grid
+    const grid = new Uint8Array(gw * gh);
+    for (let gy = 0; gy < gh; gy++) {
+      for (let gx = 0; gx < gw; gx++) {
+        let skinCount = 0;
+        let totalCount = 0;
+        const px0 = gx * GRID;
+        const py0 = gy * GRID;
+        const px1 = Math.min(px0 + GRID, cw);
+        const py1 = Math.min(py0 + GRID, ch);
+        for (let py = py0; py < py1; py++) {
+          for (let px = px0; px < px1; px++) {
+            const idx = (py * cw + px) * 4;
+            const r = data[idx], g = data[idx + 1], b = data[idx + 2];
+            const y  = 0.299 * r + 0.587 * g + 0.114 * b;
+            const cb = 128 - 0.169 * r - 0.331 * g + 0.5 * b;
+            const cr = 128 + 0.5 * r - 0.419 * g - 0.081 * b;
+            if (y > 50 && cb >= 77 && cb <= 135 && cr >= 130 && cr <= 180) skinCount++;
+            totalCount++;
+          }
+        }
+        if (totalCount > 0 && skinCount / totalCount >= SKIN_CELL_RATIO) {
+          grid[gy * gw + gx] = 1;
+        }
+      }
+    }
+
+    // Connected-component labeling (BFS)
+    const labels = new Int32Array(gw * gh);
+    let nextLabel = 1;
+    const components = [];
+    for (let gy = 0; gy < gh; gy++) {
+      for (let gx = 0; gx < gw; gx++) {
+        const idx = gy * gw + gx;
+        if (grid[idx] !== 1 || labels[idx] !== 0) continue;
+        const label = nextLabel++;
+        const queue = [idx];
+        labels[idx] = label;
+        let minX = gx, maxX = gx, minY = gy, maxY = gy, count = 0;
+        while (queue.length > 0) {
+          const ci = queue.pop();
+          const cx = ci % gw, cy = (ci - cx) / gw;
+          count++;
+          if (cx < minX) minX = cx; if (cx > maxX) maxX = cx;
+          if (cy < minY) minY = cy; if (cy > maxY) maxY = cy;
+          if (cy > 0)      { const ni = (cy - 1) * gw + cx; if (grid[ni] === 1 && labels[ni] === 0) { labels[ni] = label; queue.push(ni); } }
+          if (cy < gh - 1) { const ni = (cy + 1) * gw + cx; if (grid[ni] === 1 && labels[ni] === 0) { labels[ni] = label; queue.push(ni); } }
+          if (cx > 0)      { const ni = cy * gw + cx - 1;   if (grid[ni] === 1 && labels[ni] === 0) { labels[ni] = label; queue.push(ni); } }
+          if (cx < gw - 1) { const ni = cy * gw + cx + 1;   if (grid[ni] === 1 && labels[ni] === 0) { labels[ni] = label; queue.push(ni); } }
+        }
+        components.push({ minX, minY, maxX, maxY, count });
+      }
+    }
+
+    const srcW = source.videoWidth || source.width || cw;
+    const srcH = source.videoHeight || source.height || ch;
+    const scaleX = srcW / cw, scaleY = srcH / ch;
+    const faces = [];
+    for (const comp of components) {
+      if (comp.count < MIN_COMPONENT_CELLS) continue;
+      const cellsW = comp.maxX - comp.minX + 1;
+      const cellsH = comp.maxY - comp.minY + 1;
+      const aspect = cellsW / (cellsH || 1);
+      if (aspect < MIN_ASPECT || aspect > MAX_ASPECT) continue;
+      faces.push({
+        boundingBox: {
+          x: comp.minX * GRID * scaleX,
+          y: comp.minY * GRID * scaleY,
+          width:  cellsW * GRID * scaleX,
+          height: cellsH * GRID * scaleY
+        }
+      });
+    }
+    return faces;
+  }
+}
+
+// ──────────────────────────────────────
+// Unified detection dispatcher
+// ──────────────────────────────────────
+
+let skinDetector = null;
+function getSkinDetector() {
+  if (!skinDetector) skinDetector = new SkinFaceDetector();
+  return skinDetector;
+}
+
+// Extract landmarks from Native FaceDetector result.
+// Native returns: { landmarks: [{ type: 'eye'|'mouth'|'nose', locations: [{x,y}] }] }
+function _nativeLandmarks(face) {
+  if (!face.landmarks || !face.landmarks.length) return null;
+  const pts = {};
+  for (const lm of face.landmarks) {
+    if (lm.locations && lm.locations.length > 0) {
+      const loc = lm.locations[0];
+      if (lm.type === 'eye') {
+        if (!pts.eye1) pts.eye1 = loc; else pts.eye2 = loc;
+      } else if (lm.type === 'nose') {
+        pts.nose = loc;
+      } else if (lm.type === 'mouth') {
+        pts.mouth = loc;
+      }
+    }
+  }
+  if (!pts.eye1 || !pts.eye2) return null;
+  return {
+    leftEye:  { x: Math.min(pts.eye1.x, pts.eye2.x), y: (pts.eye1.x < pts.eye2.x ? pts.eye1 : pts.eye2).y },
+    rightEye: { x: Math.max(pts.eye1.x, pts.eye2.x), y: (pts.eye1.x > pts.eye2.x ? pts.eye1 : pts.eye2).y },
+    nose: pts.nose || null,
+    mouth: pts.mouth || null
+  };
+}
+
+// MediaPipe BlazeFace keypoints order: [rightEye, leftEye, noseTip, mouth, rightEar, leftEar]
+function _mpLandmarks(keypoints, imgW, imgH) {
+  if (!keypoints || keypoints.length < 6) return null;
+  return {
+    leftEye:   { x: keypoints[1].x * imgW, y: keypoints[1].y * imgH },
+    rightEye:  { x: keypoints[0].x * imgW, y: keypoints[0].y * imgH },
+    nose:      { x: keypoints[2].x * imgW, y: keypoints[2].y * imgH },
+    mouth:     { x: keypoints[3].x * imgW, y: keypoints[3].y * imgH },
+    rightEar:  { x: keypoints[4].x * imgW, y: keypoints[4].y * imgH },
+    leftEar:   { x: keypoints[5].x * imgW, y: keypoints[5].y * imgH }
+  };
+}
+
+function detectFaces(source, timestamp) {
+  const imgW = source.videoWidth || source.width || 640;
+  const imgH = source.videoHeight || source.height || 480;
+
+  // Tier 1 — native
+  const native = getNativeDetector();
+  if (native) {
+    try {
+      return native.detect(source).then(faces =>
+        faces.map(f => ({
+          boundingBox: f.boundingBox,
+          landmarks: _nativeLandmarks(f)
+        }))
+      );
+    } catch {
+      // fall through
+    }
+  }
+
+  // Tier 2 — MediaPipe (non-blocking: only used once loaded)
+  if (mpReady && mpDetector) {
+    try {
+      const result = mpDetector.detectForVideo(source, timestamp);
+      return Promise.resolve(
+        (result.detections || []).map(d => ({
+          boundingBox: {
+            x: d.boundingBox.originX,
+            y: d.boundingBox.originY,
+            width: d.boundingBox.width,
+            height: d.boundingBox.height
+          },
+          landmarks: _mpLandmarks(d.keypoints, imgW, imgH)
+        }))
+      );
+    } catch (err) {
+      log({ mediaPipeDetectError: err?.message || err });
+      // fall through to skin
+    }
+  }
+
+  // Tier 3 — skin-color (no landmarks)
+  return getSkinDetector().detect(source);
+}
+
+// ──────────────────────────
+// Optimized pixelation
+// ──────────────────────────
+
+// Simple fast PRNG (xorshift32) to avoid Math.random() overhead per block
+let _prngState = 1;
+function _fastRand() {
+  _prngState ^= _prngState << 13;
+  _prngState ^= _prngState >> 17;
+  _prngState ^= _prngState << 5;
+  return (_prngState >>> 0) / 4294967296;
+}
+
+const COLOR_NOISE = 30; // ±30 per channel — enough to break skin-tone patterns
+
+function pixelateRegion(ctx, x, y, w, h, blockSize) {
+  const bs = Math.max(4, blockSize);
+  const x0 = Math.max(0, Math.floor(x));
+  const y0 = Math.max(0, Math.floor(y));
+  const x1 = Math.min(ctx.canvas.width, Math.ceil(x + w));
+  const y1 = Math.min(ctx.canvas.height, Math.ceil(y + h));
+  const regionW = x1 - x0;
+  const regionH = y1 - y0;
+  if (regionW <= 0 || regionH <= 0) return;
+
+  let regionData;
+  try { regionData = ctx.getImageData(x0, y0, regionW, regionH); } catch { return; }
+  const data = regionData.data;
+
+  // Seed PRNG per frame region so noise is temporally stable within a detection cycle
+  _prngState = (x0 * 7 + y0 * 13 + regionW * 19 + 1) | 1;
+
+  for (let by = 0; by < regionH; by += bs) {
+    for (let bx = 0; bx < regionW; bx += bs) {
+      const sw = Math.min(bs, regionW - bx);
+      const sh = Math.min(bs, regionH - by);
+      const cx = bx + (sw >> 1);
+      const cy = by + (sh >> 1);
+      const idx = (cy * regionW + cx) * 4;
+      // Add per-block color noise to prevent skin-tone pattern recognition
+      const nr = Math.max(0, Math.min(255, data[idx]     + ((_fastRand() * 2 - 1) * COLOR_NOISE) | 0));
+      const ng = Math.max(0, Math.min(255, data[idx + 1] + ((_fastRand() * 2 - 1) * COLOR_NOISE) | 0));
+      const nb = Math.max(0, Math.min(255, data[idx + 2] + ((_fastRand() * 2 - 1) * COLOR_NOISE) | 0));
+      ctx.fillStyle = `rgb(${nr},${ng},${nb})`;
+      ctx.fillRect(x0 + bx, y0 + by, sw, sh);
+    }
+  }
+}
+
+// ──────────────────────────────────────
+// Ellipse from landmarks
+// ──────────────────────────────────────
+
+// Compute an ellipse that covers the face based on landmark positions.
+// Returns { cx, cy, rx, ry } in pixel coordinates.
+function landmarksToEllipse(lm, box) {
+  const eyeMidX = (lm.leftEye.x + lm.rightEye.x) / 2;
+  const eyeMidY = (lm.leftEye.y + lm.rightEye.y) / 2;
+  const eyeDist = Math.hypot(lm.rightEye.x - lm.leftEye.x, lm.rightEye.y - lm.leftEye.y);
+
+  // Use ear-to-ear distance if available (MediaPipe), otherwise estimate from eye distance
+  let faceWidth;
+  if (lm.leftEar && lm.rightEar) {
+    faceWidth = Math.hypot(lm.rightEar.x - lm.leftEar.x, lm.rightEar.y - lm.leftEar.y);
+  } else {
+    faceWidth = eyeDist * 2.4;  // empirical: face width ≈ 2.4× eye distance
+  }
+
+  // Vertical: from forehead (above eyes) to chin (below mouth)
+  let faceHeight;
+  if (lm.mouth) {
+    const eyeToMouth = Math.hypot(lm.mouth.x - eyeMidX, lm.mouth.y - eyeMidY);
+    faceHeight = eyeToMouth * 2.8;  // mouth is ~60% down from forehead to chin
+  } else {
+    faceHeight = faceWidth * 1.35;  // standard face aspect ratio
+  }
+
+  // Center: shift slightly below eye midpoint (eyes are in upper 1/3 of face)
+  const cy = lm.mouth
+    ? eyeMidY + (lm.mouth.y - eyeMidY) * 0.35
+    : eyeMidY + faceHeight * 0.1;
+
+  return {
+    cx: eyeMidX,
+    cy,
+    rx: faceWidth * 0.58,   // semi-axis X with slight padding
+    ry: faceHeight * 0.52   // semi-axis Y with slight padding
+  };
+}
+
+// Pixelate an elliptical region using canvas clip
+function pixelateEllipse(ctx, cx, cy, rx, ry, blockSize) {
+  if (rx <= 0 || ry <= 0) return;
+  const x0 = Math.max(0, Math.floor(cx - rx));
+  const y0 = Math.max(0, Math.floor(cy - ry));
+  const x1 = Math.min(ctx.canvas.width, Math.ceil(cx + rx));
+  const y1 = Math.min(ctx.canvas.height, Math.ceil(cy + ry));
+  const regionW = x1 - x0;
+  const regionH = y1 - y0;
+  if (regionW <= 0 || regionH <= 0) return;
+
+  let regionData;
+  try { regionData = ctx.getImageData(x0, y0, regionW, regionH); } catch { return; }
+  const data = regionData.data;
+  const bs = Math.max(4, blockSize);
+
+  // Precompute ellipse test: (px-cx)²/rx² + (py-cy)²/ry² <= 1
+  const rxSq = rx * rx;
+  const rySq = ry * ry;
+
+  _prngState = (x0 * 7 + y0 * 13 + regionW * 19 + 1) | 1;
+
+  ctx.save();
+  ctx.beginPath();
+  ctx.ellipse(cx, cy, rx, ry, 0, 0, Math.PI * 2);
+  ctx.clip();
+
+  for (let by = 0; by < regionH; by += bs) {
+    for (let bx = 0; bx < regionW; bx += bs) {
+      const sw = Math.min(bs, regionW - bx);
+      const sh = Math.min(bs, regionH - by);
+      // Block center in canvas coords
+      const bcx = x0 + bx + (sw >> 1);
+      const bcy = y0 + by + (sh >> 1);
+      // Skip blocks outside ellipse (clip handles edges, but this avoids unnecessary fillRect)
+      const dx = bcx - cx, dy = bcy - cy;
+      if ((dx * dx) / rxSq + (dy * dy) / rySq > 1.2) continue;
+
+      const sIdx = (by + (sh >> 1)) * regionW + bx + (sw >> 1);
+      const idx = sIdx * 4;
+      const nr = Math.max(0, Math.min(255, data[idx]     + ((_fastRand() * 2 - 1) * COLOR_NOISE) | 0));
+      const ng = Math.max(0, Math.min(255, data[idx + 1] + ((_fastRand() * 2 - 1) * COLOR_NOISE) | 0));
+      const nb = Math.max(0, Math.min(255, data[idx + 2] + ((_fastRand() * 2 - 1) * COLOR_NOISE) | 0));
+      ctx.fillStyle = `rgb(${nr},${ng},${nb})`;
+      ctx.fillRect(x0 + bx, y0 + by, sw, sh);
+    }
+  }
+
+  ctx.restore();
+}
+
+// ──────────────────────────
+// Pipeline
+// ──────────────────────────
+
+/**
+ * Create a face blur processing pipeline.
+ *
+ * @param {MediaStreamTrack} sourceTrack - The camera video track to process.
+ * @returns {{ track, setMode, getMode, setEnabled, isEnabled, updateSource, destroy } | null}
+ *          null when the browser lacks captureStream support.
+ */
+export function createFaceBlurPipeline(sourceTrack) {
+  let mode = BLUR_MODE.FACE;   // 'face' | 'background' | 'off'
+  let destroyed = false;
+  let currentSource = sourceTrack;
+  let lastDetectTime = 0;
+  let lastDrawTime = 0;
+  let cachedFaces = [];
+  let animFrameId = null;
+  let safariIntervalId = null;
+
+  // Hidden video element to feed camera frames
+  const srcVideo = document.createElement('video');
+  srcVideo.setAttribute('playsinline', '');
+  srcVideo.setAttribute('autoplay', '');
+  srcVideo.setAttribute('muted', '');
+  srcVideo.muted = true;
+  srcVideo.playsInline = true;
+  srcVideo.style.cssText = 'position:fixed;top:-9999px;left:-9999px;width:1px;height:1px;opacity:0;pointer-events:none';
+  document.body.appendChild(srcVideo);
+
+  // Canvas for processing
+  const canvas = document.createElement('canvas');
+  const ctx = canvas.getContext('2d', { willReadFrequently: true });
+
+  // captureStream support check
+  if (typeof canvas.captureStream !== 'function') {
+    log({ faceBlur: 'captureStream not supported — pipeline disabled' });
+    try { srcVideo.remove(); } catch {}
+    return null;
+  }
+
+  const outputStream = canvas.captureStream(TARGET_FPS);
+  const outputTrack = outputStream.getVideoTracks()[0];
+  if (!outputTrack) {
+    log({ faceBlur: 'captureStream produced no video track' });
+    try { srcVideo.remove(); } catch {}
+    return null;
+  }
+
+  function attachSource(track) {
+    const ms = new MediaStream([track]);
+    srcVideo.srcObject = ms;
+    srcVideo.play().catch(() => {});
+    const settings = track.getSettings?.() || {};
+    canvas.width  = settings.width  || 640;
+    canvas.height = settings.height || 480;
+  }
+  attachSource(currentSource);
+
+  srcVideo.addEventListener('loadedmetadata', () => {
+    if (srcVideo.videoWidth && srcVideo.videoHeight) {
+      canvas.width  = srcVideo.videoWidth;
+      canvas.height = srcVideo.videoHeight;
+    }
+  });
+
+  // If native FaceDetector is unavailable, start loading MediaPipe in background
+  if (!getNativeDetector()) {
+    startMediaPipeLoad();
+  }
+
+  // ── Render loop ──
+  const useRVFC = typeof HTMLVideoElement !== 'undefined' &&
+    'requestVideoFrameCallback' in HTMLVideoElement.prototype;
+
+  function scheduleNextFrame() {
+    if (destroyed) return;
+    if (useRVFC) {
+      try {
+        srcVideo.requestVideoFrameCallback(() => processFrame());
+      } catch {
+        animFrameId = requestAnimationFrame(() => processFrame());
+      }
+    } else {
+      animFrameId = requestAnimationFrame(() => processFrame());
+    }
+  }
+
+  async function processFrame() {
+    if (destroyed) return;
+    scheduleNextFrame();
+
+    if (srcVideo.readyState < 2) return;
+    ctx.drawImage(srcVideo, 0, 0, canvas.width, canvas.height);
+    lastDrawTime = performance.now();
+
+    if (mode === BLUR_MODE.OFF) return;
+
+    const now = performance.now();
+    if (now - lastDetectTime > DETECT_INTERVAL_MS) {
+      lastDetectTime = now;
+      try {
+        if (srcVideo.readyState >= 2) {
+          cachedFaces = await detectFaces(srcVideo, now);
+        }
+      } catch (err) {
+        if (err?.name !== 'InvalidStateError') {
+          log({ faceBlurDetectError: err?.message || err });
+        }
+      }
+    }
+
+    if (mode === BLUR_MODE.FACE) {
+      // Pixelate detected face regions — ellipse when landmarks available, rect fallback
+      for (const face of cachedFaces) {
+        const box = face.boundingBox;
+        if (!box) continue;
+        if (face.landmarks) {
+          const el = landmarksToEllipse(face.landmarks, box);
+          pixelateEllipse(ctx, el.cx, el.cy, el.rx, el.ry, PIXEL_BLOCK);
+        } else {
+          const padX = box.width * 0.35;
+          const padY = box.height * 0.35;
+          pixelateRegion(ctx, box.x - padX, box.y - padY, box.width + padX * 2, box.height + padY * 2, PIXEL_BLOCK);
+        }
+      }
+    } else if (mode === BLUR_MODE.BACKGROUND) {
+      // Save face regions (elliptical when possible), pixelate entire frame, then restore
+      const savedRegions = [];
+      for (const face of cachedFaces) {
+        const box = face.boundingBox;
+        if (!box) continue;
+        let rx, ry, rw, rh;
+        if (face.landmarks) {
+          const el = landmarksToEllipse(face.landmarks, box);
+          rx = Math.max(0, Math.floor(el.cx - el.rx));
+          ry = Math.max(0, Math.floor(el.cy - el.ry));
+          rw = Math.min(canvas.width - rx, Math.ceil(el.rx * 2));
+          rh = Math.min(canvas.height - ry, Math.ceil(el.ry * 2));
+        } else {
+          const padX = box.width * 0.25;
+          const padY = box.height * 0.25;
+          rx = Math.max(0, Math.floor(box.x - padX));
+          ry = Math.max(0, Math.floor(box.y - padY));
+          rw = Math.min(canvas.width - rx, Math.ceil(box.width + padX * 2));
+          rh = Math.min(canvas.height - ry, Math.ceil(box.height + padY * 2));
+        }
+        if (rw > 0 && rh > 0) {
+          try {
+            savedRegions.push({ data: ctx.getImageData(rx, ry, rw, rh), x: rx, y: ry, face });
+          } catch {}
+        }
+      }
+      pixelateRegion(ctx, 0, 0, canvas.width, canvas.height, PIXEL_BLOCK);
+      for (const region of savedRegions) {
+        // Restore face region — use elliptical clip when landmarks available
+        if (region.face.landmarks) {
+          const el = landmarksToEllipse(region.face.landmarks, region.face.boundingBox);
+          ctx.save();
+          ctx.beginPath();
+          ctx.ellipse(el.cx, el.cy, el.rx, el.ry, 0, 0, Math.PI * 2);
+          ctx.clip();
+          try { ctx.putImageData(region.data, region.x, region.y); } catch {}
+          // putImageData ignores clip, so redraw the original region within clip
+          ctx.drawImage(srcVideo, region.x, region.y, region.data.width, region.data.height, region.x, region.y, region.data.width, region.data.height);
+          ctx.restore();
+        } else {
+          try { ctx.putImageData(region.data, region.x, region.y); } catch {}
+        }
+      }
+    }
+  }
+
+  // Safari captureStream heartbeat
+  const isSafari = typeof navigator !== 'undefined' &&
+    /^((?!chrome|android).)*safari/i.test(navigator.userAgent);
+  if (isSafari) {
+    safariIntervalId = setInterval(() => {
+      if (destroyed || srcVideo.readyState < 2) return;
+      if (performance.now() - lastDrawTime > 80) {
+        ctx.drawImage(srcVideo, 0, 0, canvas.width, canvas.height);
+        lastDrawTime = performance.now();
+      }
+    }, Math.floor(1000 / TARGET_FPS));
+  }
+
+  processFrame();
+
+  const detectorKind = getNativeDetector() ? 'native' : mpReady ? 'mediapipe' : 'skin-color (mediapipe loading)';
+  log({ faceBlurDetector: detectorKind, isSafari: !!isSafari });
+
+  return {
+    track: outputTrack,
+
+    setMode(m) {
+      mode = (m === BLUR_MODE.BACKGROUND || m === BLUR_MODE.OFF) ? m : BLUR_MODE.FACE;
+      if (mode === BLUR_MODE.OFF) cachedFaces = [];
+    },
+
+    getMode() { return mode; },
+
+    /** @deprecated Use setMode() instead */
+    setEnabled(val) {
+      mode = val ? BLUR_MODE.FACE : BLUR_MODE.OFF;
+      if (mode === BLUR_MODE.OFF) cachedFaces = [];
+    },
+
+    isEnabled() { return mode !== BLUR_MODE.OFF; },
+
+    updateSource(newTrack) {
+      if (destroyed) return;
+      currentSource = newTrack;
+      cachedFaces = [];
+      attachSource(newTrack);
+    },
+
+    destroy() {
+      if (destroyed) return;
+      destroyed = true;
+      cachedFaces = [];
+      if (animFrameId) {
+        cancelAnimationFrame(animFrameId);
+        animFrameId = null;
+      }
+      if (safariIntervalId) {
+        clearInterval(safariIntervalId);
+        safariIntervalId = null;
+      }
+      try { outputTrack.stop(); } catch {}
+      try { srcVideo.srcObject = null; } catch {}
+      try { srcVideo.remove(); } catch {}
+      nativeDetector = null;
+    }
+  };
+}
+
+/**
+ * Check if the browser can run the face blur pipeline.
+ * Requires canvas.captureStream() — Chrome 51+, Firefox 43+, Safari 15+, iOS Safari 15+.
+ */
+export function isFaceBlurSupported() {
+  if (typeof document === 'undefined') return false;
+  try {
+    const c = document.createElement('canvas');
+    return typeof c.captureStream === 'function';
+  } catch {
+    return false;
+  }
+}

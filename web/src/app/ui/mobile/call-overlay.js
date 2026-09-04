@@ -1,0 +1,1999 @@
+import { log } from '../../core/log.js';
+import { cancelCall, acknowledgeCall } from '../../api/calls.js';
+import {
+  CALL_EVENT,
+  CALL_SESSION_STATUS,
+  CALL_REQUEST_KIND,
+  subscribeCallEvent,
+  getCallSessionSnapshot,
+  sendCallSignal,
+  completeCallSession,
+  updateCallSessionStatus,
+  acceptIncomingCallMedia,
+  endCallMediaSession,
+  setLocalAudioMuted,
+  isLocalAudioMuted,
+  isLocalVideoMuted,
+  setLocalVideoMuted,
+  setRemoteVideoElement,
+  setLocalVideoElement,
+  getLocalDisplayStream,
+  getRemoteStream,
+  toggleLocalVideo,
+  switchCamera,
+  getCameraFacing,
+  resolveCallPeerProfile,
+  setFaceBlurMode,
+  getFaceBlurMode,
+  createFaceBlurPipeline,
+  isFaceBlurSupported,
+  BLUR_MODE,
+  isKeyDerivationPending,
+  retryDeriveKeys,
+  getCallKeyContext,
+  isEphemeralCallMode
+} from '../../features/calls/index.js';
+import { sessionStore } from './session-store.js';
+import { isNativeCallMode } from '../../features/calls/native-media-bridge.js';
+import { CALL_MEDIA_STATE_STATUS } from '../../../shared/calls/schemas.js';
+import { createCallAudioManager } from './call-audio.js';
+import { getCallAudioConstraints } from './browser-detection.js';
+import { showCallInfoOverlay } from '../../features/calls/call-info-overlay.js';
+import { initNativeCallBridge, setNativeCallActionHandlers } from '../../features/native-call-bridge.js';
+import { isNativeApp, postNativeMessage, onNativeEvent } from '../../features/native-bridge.js';
+import { t } from '/locales/index.js';
+
+function getStatusLabel() {
+  return {
+    [CALL_SESSION_STATUS.OUTGOING]: t('calls.dialing'),
+    [CALL_SESSION_STATUS.INCOMING]: t('calls.incoming'),
+    [CALL_SESSION_STATUS.CONNECTING]: t('calls.connectingCall'),
+    [CALL_SESSION_STATUS.IN_CALL]: t('calls.inCall')
+  };
+}
+
+function getMediaStatusLabel() {
+  return {
+    [CALL_MEDIA_STATE_STATUS.KEY_PENDING]: t('callEncryption.keyPending'),
+    [CALL_MEDIA_STATE_STATUS.ROTATING]: t('callEncryption.rotating'),
+    [CALL_MEDIA_STATE_STATUS.FAILED]: t('callEncryption.encryptionFailed')
+  };
+}
+
+function getEncryptionStatusLabel() {
+  return {
+    [CALL_MEDIA_STATE_STATUS.READY]: t('callEncryption.e2eeActive'),
+    [CALL_MEDIA_STATE_STATUS.KEY_PENDING]: t('callEncryption.e2eePending'),
+    [CALL_MEDIA_STATE_STATUS.ROTATING]: t('callEncryption.rotating'),
+    [CALL_MEDIA_STATE_STATUS.FAILED]: t('callEncryption.cannotProtectCall'),
+    [CALL_MEDIA_STATE_STATUS.SKIPPED]: t('callEncryption.callUnencrypted')
+  };
+}
+
+const BUBBLE_SIZE = 76;
+const BUBBLE_MARGIN = 16;
+const MIN_DRAG_DISTANCE = 6;
+
+function describeStatus(session) {
+  if (!session) return t('status.connecting');
+  // Show encryption status for incoming calls when key derivation is pending
+  if (session.status === CALL_SESSION_STATUS.INCOMING && isKeyDerivationPending()) {
+    return t('callEncryption.e2eePending');
+  }
+  const mediaStatus = session.mediaState?.status || null;
+  const mediaLabels = getMediaStatusLabel();
+  if (mediaStatus && mediaLabels[mediaStatus]) {
+    return mediaLabels[mediaStatus];
+  }
+  return getStatusLabel()[session.status] || t('status.connecting');
+}
+
+function describeSecureStatus(session) {
+  if (!session) return t('callEncryption.preparingE2ee');
+  const mediaStatus = session.mediaState?.status;
+  return getEncryptionStatusLabel()[mediaStatus] || t('callEncryption.preparingE2ee');
+}
+
+function formatDuration(ms) {
+  const totalSeconds = Math.max(0, Math.floor(ms / 1000));
+  const minutes = String(Math.floor(totalSeconds / 60)).padStart(2, '0');
+  const seconds = String(totalSeconds % 60).padStart(2, '0');
+  return `${minutes}:${seconds}`;
+}
+
+function ensureStyles() {
+  if (typeof document === 'undefined') return;
+  if (document.getElementById('callOverlayStyles')) return;
+  const style = document.createElement('style');
+  style.id = 'callOverlayStyles';
+  style.textContent = `
+    .call-overlay {
+      position: fixed;
+      inset: 0;
+      display: flex;
+      justify-content: center;
+      align-items: flex-end;
+      padding: 16px;
+      pointer-events: none;
+      z-index: 999;
+    }
+    .call-overlay.hidden { opacity: 0; }
+    .call-overlay .call-card {
+      position: relative;
+      width: min(420px, 100%);
+      background: rgba(15, 23, 42, 0.92);
+      color: #f8fafc;
+      border-radius: 20px;
+      padding: 20px;
+      box-shadow: 0 20px 60px rgba(15, 23, 42, 0.45);
+      backdrop-filter: blur(10px);
+      pointer-events: auto;
+      transform: translateY(12px);
+      transition: transform 200ms ease, opacity 200ms ease;
+    }
+    .call-overlay.hidden .call-card {
+      transform: translateY(40px);
+      opacity: 0;
+      pointer-events: none;
+    }
+    .call-overlay .call-peer {
+      display: flex;
+      align-items: flex-start;
+      gap: 14px;
+    }
+    .call-overlay .call-avatar {
+      width: 60px;
+      height: 60px;
+      border-radius: 999px;
+      background: rgba(255,255,255,0.1);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 22px;
+      font-weight: 600;
+      overflow: hidden;
+    }
+    .call-overlay .call-avatar img {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+    }
+    .call-overlay .call-meta {
+      flex: 1;
+      min-width: 0;
+    }
+    .call-overlay .call-meta strong {
+      font-size: 18px;
+      display: block;
+    }
+    .call-overlay .call-meta span {
+      font-size: 14px;
+      color: rgba(248,250,252,0.7);
+    }
+    .call-overlay .call-timer {
+      display: block;
+      margin-top: 2px;
+      font-size: 13px;
+      color: rgba(248,250,252,0.65);
+      letter-spacing: 0.04em;
+    }
+    .call-overlay .call-security {
+      margin-top: 12px;
+      font-size: 13px;
+      color: rgba(248,250,252,0.65);
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .call-overlay .call-security .dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 999px;
+      background: #0ea5e9;
+      display: inline-block;
+    }
+    .call-overlay .call-actions {
+      margin-top: 18px;
+      display: flex;
+      justify-content: center;
+      gap: 18px;
+    }
+    .call-overlay .call-controls {
+      margin-top: 22px;
+      display: flex;
+      gap: 20px;
+      row-gap: 16px;
+      justify-content: center;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+    /* In-call controls auto-hide: fade out after inactivity, reveal on tap. */
+    .call-overlay .call-controls.auto-hide {
+      transition: opacity 250ms ease, transform 250ms ease;
+    }
+    .call-overlay .call-controls.auto-hide.controls-hidden {
+      opacity: 0;
+      transform: translateY(10px);
+      pointer-events: none;
+    }
+    .call-overlay .call-controls.hidden,
+    .call-overlay .call-actions.hidden {
+      display: none;
+    }
+    .call-overlay .call-btn {
+      min-width: 64px;
+      height: 64px;
+      border-radius: 999px;
+      border: none;
+      font-size: 14px;
+      color: #fff;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      transition: transform 120ms ease, opacity 120ms ease;
+      background: #1e293b;
+      padding: 0 18px;
+    }
+    .call-overlay .call-btn i {
+      font-size: 20px;
+      margin-right: 6px;
+    }
+    .call-overlay .call-btn:disabled {
+      opacity: 0.6;
+      cursor: not-allowed;
+    }
+    .call-overlay .call-btn.accept { background: #0ea5e9; }
+    .call-overlay .call-btn.reject { background: #ef4444; }
+    .call-overlay .call-btn.cancel { background: #475569; }
+    .call-overlay .call-btn.hangup { background: #ef4444; }
+    .call-overlay .call-btn.toggle.active {
+      background: #0ea5e9;
+      box-shadow: 0 0 18px rgba(14,165,233,0.45);
+    }
+    .call-overlay .call-blur-mode-btn {
+      position: absolute;
+      top: 12px;
+      left: 50%;
+      transform: translateX(-50%);
+      background: rgba(15, 23, 42, 0.7);
+      color: #f8fafc;
+      border: 1px solid rgba(255,255,255,0.18);
+      border-radius: 20px;
+      padding: 6px 14px;
+      font-size: 13px;
+      cursor: pointer;
+      display: none;
+      align-items: center;
+      gap: 6px;
+      z-index: 10;
+      backdrop-filter: blur(4px);
+      -webkit-backdrop-filter: blur(4px);
+      transition: background 150ms ease, border-color 150ms ease;
+      white-space: nowrap;
+    }
+    .call-overlay .call-blur-mode-btn:active {
+      transform: translateX(-50%) scale(0.95);
+    }
+    .call-overlay .call-blur-mode-btn i {
+      font-size: 16px;
+      margin: 0;
+    }
+    .call-overlay .call-blur-mode-btn[data-blur-mode="face"] {
+      border-color: rgba(14,165,233,0.5);
+      background: rgba(14,165,233,0.25);
+    }
+    .call-overlay .call-blur-mode-btn[data-blur-mode="background"] {
+      border-color: rgba(168,85,247,0.5);
+      background: rgba(168,85,247,0.25);
+    }
+    .call-overlay .call-blur-mode-btn[data-blur-mode="off"] {
+      border-color: rgba(255,255,255,0.12);
+      background: rgba(15,23,42,0.55);
+      color: rgba(248,250,252,0.6);
+    }
+    .call-overlay .call-controls .call-btn {
+      min-width: 48px;
+      width: 48px;
+      height: 48px;
+      padding: 0;
+    }
+    .call-overlay .call-controls .call-btn i {
+      margin-right: 0;
+      font-size: 22px;
+    }
+    .call-overlay .call-controls .call-btn span {
+      display: none;
+    }
+    /* Hangup sits on its own (second) row: centered red pill with a label. */
+    .call-overlay .call-controls .call-btn.hangup {
+      flex: 0 0 100%;
+      width: auto;
+      max-width: 200px;
+      height: 48px;
+      margin: 2px auto 0;
+      padding: 0 24px;
+      border-radius: 999px;
+    }
+    .call-overlay .call-controls .call-btn.hangup span {
+      display: inline;
+      margin-left: 8px;
+      font-size: 14px;
+    }
+    .call-overlay .call-minify-btn {
+      position: absolute;
+      top: 12px;
+      right: 12px;
+      width: 32px;
+      height: 32px;
+      border-radius: 999px;
+      border: none;
+      background: rgba(15,23,42,0.4);
+      color: #f8fafc;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      transition: opacity 160ms ease, transform 160ms ease;
+    }
+    .call-overlay .call-minify-btn i {
+      font-size: 18px;
+      margin: 0;
+    }
+    .call-overlay .call-minify-btn:active {
+      transform: scale(0.9);
+    }
+    .call-overlay .call-mini-bubble {
+      position: fixed;
+      width: 76px;
+      height: 76px;
+      border-radius: 999px;
+      background: rgba(15,23,42,0.95);
+      box-shadow: 0 12px 30px rgba(15, 23, 42, 0.55);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      opacity: 0;
+      transform: scale(0.8);
+      transition: opacity 200ms ease, transform 200ms ease;
+      pointer-events: none;
+      touch-action: none;
+      z-index: 1000;
+      overflow: hidden;
+    }
+    .call-overlay .call-mini-bubble.dragging {
+      opacity: 0.85;
+    }
+    .call-overlay .call-mini-avatar {
+      width: 48px;
+      height: 48px;
+      border-radius: 999px;
+      background: rgba(248,250,252,0.1);
+      color: #f8fafc;
+      font-size: 16px;
+      font-weight: 600;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      overflow: hidden;
+    }
+    .call-overlay .call-mini-avatar img {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+    }
+    .call-overlay .call-mini-video {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      display: none;
+    }
+    .call-overlay.video-minimized .call-mini-bubble {
+      width: 120px;
+      height: 160px;
+      border-radius: 12px;
+    }
+    .call-overlay.video-minimized .call-mini-video {
+      display: block;
+    }
+    .call-overlay.video-minimized .call-mini-avatar {
+      display: none;
+    }
+    .call-overlay .call-mini-local-video {
+      position: absolute;
+      bottom: 4px;
+      left: 4px;
+      width: 36px;
+      height: 48px;
+      border-radius: 6px;
+      object-fit: cover;
+      transform: scaleX(-1);
+      display: none;
+      z-index: 1;
+      border: 1.5px solid rgba(255,255,255,0.3);
+      background: #1e293b;
+    }
+    .call-overlay.video-minimized .call-mini-local-video {
+      display: block;
+    }
+    .call-overlay.minimized {
+      pointer-events: none;
+    }
+    .call-overlay.minimized .call-card {
+      opacity: 0;
+      transform: translateY(40px) scale(0.95);
+      pointer-events: none;
+    }
+    .call-overlay.minimized .call-minify-btn {
+      opacity: 0;
+      pointer-events: none;
+    }
+    .call-overlay.minimized .call-mini-bubble {
+      opacity: 1;
+      transform: scale(1);
+      pointer-events: auto;
+    }
+
+    /* ── Video mode ── */
+    .call-overlay .call-card.video-mode {
+      position: fixed;
+      inset: 0;
+      width: 100%;
+      max-width: 100%;
+      border-radius: 0;
+      padding: 0;
+      background: #000;
+      display: flex;
+      flex-direction: column;
+      transform: none;
+      backdrop-filter: none;
+      box-shadow: none;
+    }
+    .call-overlay .call-remote-video {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      background: #111;
+    }
+    .call-overlay .call-local-pip {
+      position: absolute;
+      bottom: 110px;
+      right: 16px;
+      width: 110px;
+      height: 150px;
+      border-radius: 12px;
+      border: 2px solid rgba(255,255,255,0.25);
+      overflow: hidden;
+      background: #1e293b;
+      z-index: 2;
+      touch-action: none;
+      cursor: grab;
+      user-select: none;
+    }
+    .call-overlay .call-local-pip video {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      transform: scaleX(-1);
+    }
+    .call-overlay .call-video-top-bar {
+      position: absolute;
+      top: 0;
+      left: 0;
+      right: 0;
+      padding: 16px;
+      background: linear-gradient(to bottom, rgba(0,0,0,0.6), transparent);
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      z-index: 2;
+    }
+    .call-overlay .call-video-top-bar .call-avatar {
+      width: 36px;
+      height: 36px;
+      font-size: 14px;
+    }
+    .call-overlay .call-video-top-bar .vt-name {
+      font-size: 16px;
+      font-weight: 600;
+      color: #f8fafc;
+    }
+    .call-overlay .call-video-top-bar .vt-status {
+      font-size: 13px;
+      color: rgba(248,250,252,0.7);
+    }
+    .call-overlay .call-card.video-mode .call-minify-btn {
+      position: absolute;
+      top: 12px;
+      right: 12px;
+      z-index: 3;
+    }
+    .call-overlay .call-card.video-mode .call-controls {
+      position: absolute;
+      bottom: 0;
+      left: 0;
+      right: 0;
+      padding: 24px 16px;
+      padding-bottom: max(24px, env(safe-area-inset-bottom));
+      background: linear-gradient(to top, rgba(0,0,0,0.7), transparent);
+      margin-top: 0;
+      z-index: 2;
+    }
+    .call-overlay .call-card.video-mode .call-actions {
+      position: absolute;
+      bottom: 0;
+      left: 0;
+      right: 0;
+      padding: 24px 16px;
+      padding-bottom: max(24px, env(safe-area-inset-bottom));
+      background: linear-gradient(to top, rgba(0,0,0,0.7), transparent);
+      margin-top: 0;
+      z-index: 2;
+    }
+    .call-overlay .call-card.video-mode .call-peer,
+    .call-overlay .call-card.video-mode .call-security {
+      display: none;
+    }
+    .call-overlay .call-video-waiting {
+      position: absolute;
+      inset: 0;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 12px;
+      z-index: 1;
+    }
+    .call-overlay .call-video-waiting .call-avatar {
+      width: 80px;
+      height: 80px;
+      font-size: 28px;
+    }
+    .call-overlay .call-video-waiting .vw-name {
+      font-size: 20px;
+      font-weight: 600;
+      color: #f8fafc;
+    }
+    .call-overlay .call-video-waiting .vw-status {
+      font-size: 14px;
+      color: rgba(248,250,252,0.7);
+    }
+  `;
+  document.head.appendChild(style);
+}
+
+function ensureOverlayElements() {
+  if (typeof document === 'undefined') return null;
+  let root = document.getElementById('callOverlay');
+  if (root) {
+    return {
+      root,
+      card: root.querySelector('.call-card'),
+      nameLabel: root.querySelector('.call-peer-name'),
+      statusLabel: root.querySelector('.call-status-label'),
+      timerLabel: root.querySelector('.call-timer-label'),
+      secureLabel: root.querySelector('.call-secure-label'),
+      avatar: root.querySelector('.call-avatar'),
+      acceptBtn: root.querySelector('[data-call-action="accept"]'),
+      rejectBtn: root.querySelector('[data-call-action="reject"]'),
+      cancelBtn: root.querySelector('[data-call-action="cancel"]'),
+      actionsRow: root.querySelector('.call-actions'),
+      controlsRow: root.querySelector('.call-controls'),
+      muteBtn: root.querySelector('[data-call-action="mute"]'),
+      speakerBtn: root.querySelector('[data-call-action="speaker"]'),
+      hangupBtn: root.querySelector('[data-call-action="hangup"]'),
+      cameraBtn: root.querySelector('[data-call-action="camera"]'),
+      flipCameraBtn: root.querySelector('[data-call-action="flip-camera"]'),
+      blurModeBtn: root.querySelector('[data-call-action="blur-mode"]'),
+      infoBtn: root.querySelector('[data-call-action="info"]'),
+      minifyBtn: root.querySelector('[data-call-action="minify"]'),
+      bubble: root.querySelector('.call-mini-bubble'),
+      bubbleAvatar: root.querySelector('.call-mini-avatar'),
+      miniVideo: root.querySelector('.call-mini-video'),
+      miniLocalVideo: root.querySelector('.call-mini-local-video'),
+      remoteVideo: root.querySelector('.call-remote-video'),
+      localPip: root.querySelector('.call-local-pip'),
+      localPipVideo: root.querySelector('.call-local-pip video'),
+      videoWaiting: root.querySelector('.call-video-waiting'),
+      videoWaitingAvatar: root.querySelector('.call-video-waiting .call-avatar'),
+      videoWaitingName: root.querySelector('.call-video-waiting .vw-name'),
+      videoWaitingStatus: root.querySelector('.call-video-waiting .vw-status'),
+      videoTopBar: root.querySelector('.call-video-top-bar'),
+      videoTopBarAvatar: root.querySelector('.call-video-top-bar .call-avatar'),
+      videoTopBarName: root.querySelector('.call-video-top-bar .vt-name'),
+      videoTopBarStatus: root.querySelector('.call-video-top-bar .vt-status')
+    };
+  }
+  root = document.createElement('div');
+  root.id = 'callOverlay';
+  root.className = 'call-overlay hidden';
+  root.setAttribute('aria-hidden', 'true');
+  root.innerHTML = `
+    <div class="call-card" role="dialog" aria-live="assertive">
+      <button type="button" class="call-minify-btn" data-call-action="minify" aria-label="${t('calls.minimizeWindow')}">
+        <svg class="icon"><use href="#i-chevron-down"/></svg>
+      </button>
+      <div class="call-peer">
+        <div class="call-avatar" aria-hidden="true"></div>
+        <div class="call-meta">
+          <strong class="call-peer-name">${t('common.friend')}</strong>
+          <span class="call-status-label">${t('calls.dialing')}</span>
+          <span class="call-timer-label" aria-live="off"></span>
+        </div>
+      </div>
+      <div class="call-security">
+        <span class="dot" aria-hidden="true"></span>
+        <span class="call-secure-label">${t('callEncryption.keyPending')}</span>
+      </div>
+      <div class="call-actions">
+        <button type="button" class="call-btn reject" data-call-action="reject"><svg class="icon"><use href="#i-x"/></svg>${t('calls.reject')}</button>
+        <button type="button" class="call-btn accept" data-call-action="accept"><svg class="icon"><use href="#i-phone"/></svg>${t('calls.accept')}</button>
+        <button type="button" class="call-btn cancel" data-call-action="cancel"><svg class="icon"><use href="#i-phone-off"/></svg>${t('calls.cancel')}</button>
+      </div>
+      <div class="call-controls hidden" aria-label="${t('calls.controls')}">
+        <button type="button" class="call-btn toggle" data-call-action="camera" aria-pressed="false" style="display:none">
+          <svg class="icon"><use href="#i-video"/></svg><span>${t('calls.camera')}</span>
+        </button>
+        <button type="button" class="call-btn toggle" data-call-action="mute" aria-pressed="false">
+          <svg class="icon"><use href="#i-mic-off"/></svg><span>${t('calls.mute')}</span>
+        </button>
+        <button type="button" class="call-btn toggle" data-call-action="speaker" aria-pressed="false" style="display:none">
+          <svg class="icon"><use href="#i-volume-2"/></svg><span>${t('calls.speaker')}</span>
+        </button>
+        <button type="button" class="call-btn toggle" data-call-action="flip-camera" style="display:none">
+          <svg class="icon"><use href="#i-switch-camera"/></svg><span>${t('calls.flipCamera')}</span>
+        </button>
+        <button type="button" class="call-btn toggle" data-call-action="info" aria-label="${t('calls.info')}">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="icon"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg><span>${t('calls.info')}</span>
+        </button>
+        <button type="button" class="call-btn hangup" data-call-action="hangup">
+          <svg class="icon"><use href="#i-phone-off"/></svg><span>${t('calls.hangup')}</span>
+        </button>
+      </div>
+      <button type="button" class="call-blur-mode-btn" data-call-action="blur-mode" data-blur-mode="face">
+        <svg class="icon"><use href="#i-smile"/></svg><span>${t('calls.faceBlur')}</span>
+      </button>
+      <audio id="callRemoteAudio" autoplay playsinline style="display:none"></audio>
+      <video class="call-remote-video" autoplay playsinline muted style="display:none"></video>
+      <div class="call-video-waiting" style="display:none">
+        <div class="call-avatar" aria-hidden="true"></div>
+        <div class="vw-name">${t('common.friend')}</div>
+        <div class="vw-status">${t('calls.dialing')}</div>
+      </div>
+      <div class="call-video-top-bar" style="display:none">
+        <div class="call-avatar" aria-hidden="true"></div>
+        <div>
+          <div class="vt-name">${t('common.friend')}</div>
+          <div class="vt-status">${t('calls.inCall')}</div>
+        </div>
+      </div>
+      <div class="call-local-pip" style="display:none">
+        <video autoplay playsinline muted></video>
+      </div>
+    </div>
+    <div class="call-mini-bubble" role="button" aria-label="${t('calls.returnToCall')}" tabindex="0">
+      <div class="call-mini-avatar" aria-hidden="true"></div>
+      <video class="call-mini-video" autoplay playsinline muted></video>
+      <video class="call-mini-local-video" autoplay playsinline muted></video>
+    </div>
+  `;
+  document.body.appendChild(root);
+  return {
+    root,
+    card: root.querySelector('.call-card'),
+    nameLabel: root.querySelector('.call-peer-name'),
+    statusLabel: root.querySelector('.call-status-label'),
+    timerLabel: root.querySelector('.call-timer-label'),
+    secureLabel: root.querySelector('.call-secure-label'),
+    avatar: root.querySelector('.call-avatar'),
+    acceptBtn: root.querySelector('[data-call-action="accept"]'),
+    rejectBtn: root.querySelector('[data-call-action="reject"]'),
+    cancelBtn: root.querySelector('[data-call-action="cancel"]'),
+    actionsRow: root.querySelector('.call-actions'),
+    controlsRow: root.querySelector('.call-controls'),
+    muteBtn: root.querySelector('[data-call-action="mute"]'),
+      speakerBtn: root.querySelector('[data-call-action="speaker"]'),
+      hangupBtn: root.querySelector('[data-call-action="hangup"]'),
+      cameraBtn: root.querySelector('[data-call-action="camera"]'),
+      flipCameraBtn: root.querySelector('[data-call-action="flip-camera"]'),
+      blurModeBtn: root.querySelector('[data-call-action="blur-mode"]'),
+      infoBtn: root.querySelector('[data-call-action="info"]'),
+      minifyBtn: root.querySelector('[data-call-action="minify"]'),
+      bubble: root.querySelector('.call-mini-bubble'),
+      bubbleAvatar: root.querySelector('.call-mini-avatar'),
+      miniVideo: root.querySelector('.call-mini-video'),
+      miniLocalVideo: root.querySelector('.call-mini-local-video'),
+      remoteVideo: root.querySelector('.call-remote-video'),
+      localPip: root.querySelector('.call-local-pip'),
+      localPipVideo: root.querySelector('.call-local-pip video'),
+      videoWaiting: root.querySelector('.call-video-waiting'),
+      videoWaitingAvatar: root.querySelector('.call-video-waiting .call-avatar'),
+      videoWaitingName: root.querySelector('.call-video-waiting .vw-name'),
+      videoWaitingStatus: root.querySelector('.call-video-waiting .vw-status'),
+      videoTopBar: root.querySelector('.call-video-top-bar'),
+      videoTopBarAvatar: root.querySelector('.call-video-top-bar .call-avatar'),
+      videoTopBarName: root.querySelector('.call-video-top-bar .vt-name'),
+      videoTopBarStatus: root.querySelector('.call-video-top-bar .vt-status')
+    };
+  }
+
+function resolveUiPeerProfile(session) {
+  if (!session) {
+    return {
+      name: t('common.friend'),
+      avatarUrl: null,
+      source: 'fallback',
+      peerKey: null,
+      hasNickname: false,
+      hasAvatar: false
+    };
+  }
+  const profile = resolveCallPeerProfile({
+    peerAccountDigest: session.peerAccountDigest,
+    peerDeviceId: session.peerDeviceId,
+    peerKey: session.peerKey || null,
+    displayNameFallback: session.remoteDisplayName || session.peerDisplayName || null
+  });
+  const name = profile.nickname || profile.placeholderName || profile.fallbackName || t('common.friend');
+  const avatarUrl = profile.avatarUrl || null;
+  return {
+    ...profile,
+    name,
+    avatarUrl,
+    hasNickname: !!profile.nickname,
+    hasAvatar: !!avatarUrl
+  };
+}
+
+function maybeLogPeerProfile(session, profile, state) {
+  if (!session || !profile || !state) return;
+  const logKey = `${session.callId || 'unknown'}:${profile.peerKey || profile.peerAccountDigest || 'unknown'}:${profile.source}:${profile.hasNickname ? '1' : '0'}:${profile.hasAvatar ? '1' : '0'}`;
+  if (state.lastProfileLogKey === logKey) return;
+  state.lastProfileLogKey = logKey;
+  try {
+    console.info('[call] ui:peer-profile ' + JSON.stringify({
+      callId: session.callId || null,
+      peerKey: profile.peerKey || profile.peerAccountDigest || null,
+      hasNickname: !!profile.hasNickname,
+      hasAvatar: !!profile.hasAvatar,
+      source: profile.source || 'fallback'
+    }));
+  } catch {}
+}
+
+function renderAvatarContent(el, profile) {
+  if (!el || !profile) return;
+  el.innerHTML = '';
+  if (profile.avatarUrl) {
+    const img = document.createElement('img');
+    img.src = profile.avatarUrl;
+    img.alt = profile.name || 'avatar';
+    el.appendChild(img);
+    return;
+  }
+  const peerKey = profile.peerAccountDigest || '?';
+  const initials = (profile.name || peerKey || '?')
+    .replace(/\s+/g, '')
+    .slice(0, 2)
+    .toUpperCase() || '?';
+  el.textContent = initials;
+}
+
+function updateAvatar(el, profile) {
+  renderAvatarContent(el, profile);
+}
+
+function shouldDisplay(status) {
+  return [
+    CALL_SESSION_STATUS.OUTGOING,
+    CALL_SESSION_STATUS.INCOMING,
+    CALL_SESSION_STATUS.CONNECTING,
+    CALL_SESSION_STATUS.IN_CALL
+  ].includes(status);
+}
+
+export function initCallOverlay({ showToast }) {
+  if (typeof document === 'undefined') return () => {};
+  ensureStyles();
+  const ui = ensureOverlayElements();
+  if (!ui) return () => {};
+  const state = {
+    actionBusy: false,
+    timerHandle: null,
+    timerStart: null,
+    lastStatus: CALL_SESSION_STATUS.IDLE,
+    toneCallId: null,
+    playedToneKeys: new Set(),
+    minimized: false,
+    videoSwapped: false,
+    bubble: { x: null, y: null },
+    bubbleDrag: {
+      pointerId: null,
+      startX: 0,
+      startY: 0,
+      baseX: 0,
+      baseY: 0,
+      moved: false
+    },
+    localPipDrag: {
+      pointerId: null,
+      startX: 0,
+      startY: 0,
+      baseX: 0,
+      baseY: 0,
+      moved: false
+    },
+    lastProfileLogKey: null,
+    _waitingPreview: null,
+    _waitingPreviewLoading: false,
+    _waitingBlurPipeline: null
+  };
+  const audio = createCallAudioManager();
+
+  function clampBubblePosition(x, y) {
+    if (typeof window === 'undefined') return { x, y };
+    const bw = ui.bubble?.offsetWidth || BUBBLE_SIZE;
+    const bh = ui.bubble?.offsetHeight || BUBBLE_SIZE;
+    const maxX = Math.max(BUBBLE_MARGIN, window.innerWidth - bw - BUBBLE_MARGIN);
+    const maxY = Math.max(BUBBLE_MARGIN, window.innerHeight - bh - BUBBLE_MARGIN);
+    const clampedX = Math.min(Math.max(x, BUBBLE_MARGIN), maxX);
+    const clampedY = Math.min(Math.max(y, BUBBLE_MARGIN), maxY);
+    return { x: clampedX, y: clampedY };
+  }
+
+  function applyBubblePosition() {
+    if (!ui.bubble || state.bubble.x == null || state.bubble.y == null) return;
+    const { x, y } = clampBubblePosition(state.bubble.x, state.bubble.y);
+    state.bubble.x = x;
+    state.bubble.y = y;
+    ui.bubble.style.left = `${x}px`;
+    ui.bubble.style.top = `${y}px`;
+  }
+
+  function ensureBubblePosition() {
+    if (state.bubble.x != null && state.bubble.y != null) {
+      applyBubblePosition();
+      return;
+    }
+    if (typeof window === 'undefined') return;
+    state.bubble.x = window.innerWidth - (BUBBLE_SIZE + BUBBLE_MARGIN);
+    state.bubble.y = window.innerHeight - (BUBBLE_SIZE + BUBBLE_MARGIN * 4);
+    applyBubblePosition();
+  }
+
+  function updateMinimizedState() {
+    if (!ui.root) return;
+    ui.root.classList.toggle('minimized', !!state.minimized);
+    if (state.minimized) {
+      ensureBubblePosition();
+    }
+  }
+
+  function minimizeOverlay() {
+    if (state.minimized) return;
+    state.minimized = true;
+    const session = getCallSessionSnapshot();
+    const isVideo = session?.kind === CALL_REQUEST_KIND.VIDEO;
+    ui.root?.classList.toggle('video-minimized', isVideo);
+    if (isVideo && ui.miniVideo && ui.remoteVideo?.srcObject) {
+      ui.miniVideo.srcObject = ui.remoteVideo.srcObject;
+      ui.miniVideo.play().catch(() => {});
+    }
+    if (isVideo && ui.miniLocalVideo) {
+      const localDisplay = getLocalDisplayStream();
+      if (localDisplay && localDisplay.getVideoTracks().length) {
+        ui.miniLocalVideo.srcObject = localDisplay;
+        ui.miniLocalVideo.style.transform = localMirrorTransform();
+        ui.miniLocalVideo.play().catch(() => {});
+      }
+    }
+    ensureBubblePosition();
+    updateMinimizedState();
+  }
+
+  function restoreOverlay() {
+    if (!state.minimized) return;
+    state.minimized = false;
+    ui.root?.classList.remove('video-minimized');
+    if (ui.miniVideo) ui.miniVideo.srcObject = null;
+    if (ui.miniLocalVideo) ui.miniLocalVideo.srcObject = null;
+    updateMinimizedState();
+  }
+
+  function setVisibility(visible) {
+    if (!ui.root) return;
+    ui.root.classList.toggle('hidden', !visible);
+    ui.root.setAttribute('aria-hidden', visible ? 'false' : 'true');
+    if (!visible) {
+      stopTimer();
+      cancelControlsAutoHide();
+      state.minimized = false;
+      resetVideoSwap();
+      resetPipPosition();
+      destroyWaitingBlurPipeline();
+      ui.root?.classList.remove('video-minimized');
+      if (ui.miniVideo) ui.miniVideo.srcObject = null;
+      if (ui.miniLocalVideo) ui.miniLocalVideo.srcObject = null;
+      updateMinimizedState();
+    } else {
+      updateMinimizedState();
+    }
+  }
+
+  function stopTimer() {
+    if (state.timerHandle) {
+      clearInterval(state.timerHandle);
+      state.timerHandle = null;
+    }
+    state.timerStart = null;
+    if (ui.timerLabel) ui.timerLabel.textContent = '';
+  }
+
+  function renderTimerValue() {
+    if (!ui.timerLabel || !state.timerStart) return;
+    ui.timerLabel.textContent = formatDuration(Date.now() - state.timerStart);
+  }
+
+  function updateTimer(session) {
+    if (!session || session.status !== CALL_SESSION_STATUS.IN_CALL || !session.connectedAt) {
+      stopTimer();
+      return;
+    }
+    state.timerStart = session.connectedAt;
+    renderTimerValue();
+    if (!state.timerHandle) {
+      state.timerHandle = setInterval(renderTimerValue, 1000);
+    }
+  }
+
+  function ensureToneContext(session) {
+    const callId = session?.callId || null;
+    if (callId !== state.toneCallId) {
+      state.toneCallId = callId;
+      state.playedToneKeys.clear();
+    }
+  }
+
+  function makeToneKey(kind, callId) {
+    const id = callId || 'global';
+    return `${id}:${kind}`;
+  }
+
+  function playToneOnce(kind, { callId } = {}) {
+    const key = makeToneKey(kind, callId || state.toneCallId);
+    if (state.playedToneKeys.has(key)) return;
+    state.playedToneKeys.add(key);
+    if (kind === 'accepted') {
+      audio.playAcceptedTone();
+    } else if (kind === 'ended') {
+      audio.playEndTone();
+    }
+  }
+
+  function setToggleState(btn, active) {
+    if (!btn) return;
+    btn.classList.toggle('active', !!active);
+    btn.setAttribute('aria-pressed', active ? 'true' : 'false');
+  }
+
+  /** Return the CSS transform for local self-view: mirror front camera, no mirror for rear */
+  function localMirrorTransform() {
+    return getCameraFacing() === 'environment' ? 'scaleX(1)' : 'scaleX(-1)';
+  }
+
+  const BLUR_MODE_CYCLE = [BLUR_MODE.FACE, BLUR_MODE.BACKGROUND, BLUR_MODE.OFF];
+  function getBlurModeUi() { return {
+    [BLUR_MODE.FACE]:       { icon: 'smile',  label: t('calls.faceBlur') },
+    [BLUR_MODE.BACKGROUND]: { icon: 'image',   label: t('calls.backgroundBlur') },
+    [BLUR_MODE.OFF]:        { icon: 'eye',     label: t('calls.blurOff') }
+  }; }
+
+  function syncBlurModeBtn() {
+    if (!ui.blurModeBtn) return;
+    const mode = getFaceBlurMode();
+    const info = getBlurModeUi()[mode] || getBlurModeUi()[BLUR_MODE.FACE];
+    ui.blurModeBtn.setAttribute('data-blur-mode', mode);
+    const icon = ui.blurModeBtn.querySelector('svg.icon use, svg use');
+    const span = ui.blurModeBtn.querySelector('span');
+    if (icon) icon.setAttribute('href', '#i-' + info.icon);
+    if (span) span.textContent = info.label;
+  }
+
+  function handleWindowResize() {
+    if (!state.minimized) return;
+    applyBubblePosition();
+  }
+
+  function handleBubblePointerDown(event) {
+    if (!state.minimized || !ui.bubble) return;
+    event.preventDefault();
+    const pointerId = event.pointerId ?? 'mouse';
+    state.bubbleDrag.pointerId = pointerId;
+    state.bubbleDrag.startX = event.clientX;
+    state.bubbleDrag.startY = event.clientY;
+    state.bubbleDrag.baseX = state.bubble.x ?? 0;
+    state.bubbleDrag.baseY = state.bubble.y ?? 0;
+    state.bubbleDrag.moved = false;
+    ui.bubble.setPointerCapture?.(pointerId);
+  }
+
+  function handleBubblePointerMove(event) {
+    if (!state.minimized || state.bubbleDrag.pointerId == null) return;
+    if (event.pointerId !== state.bubbleDrag.pointerId) return;
+    const dx = event.clientX - state.bubbleDrag.startX;
+    const dy = event.clientY - state.bubbleDrag.startY;
+    if (!state.bubbleDrag.moved && Math.hypot(dx, dy) > MIN_DRAG_DISTANCE) {
+      state.bubbleDrag.moved = true;
+      ui.bubble?.classList.add('dragging');
+    }
+    if (!state.bubbleDrag.moved) return;
+    state.bubble.x = state.bubbleDrag.baseX + dx;
+    state.bubble.y = state.bubbleDrag.baseY + dy;
+    applyBubblePosition();
+  }
+
+  function finishBubblePointer(event, cancelled = false) {
+    if (state.bubbleDrag.pointerId == null || event.pointerId !== state.bubbleDrag.pointerId) return;
+    ui.bubble?.releasePointerCapture?.(state.bubbleDrag.pointerId);
+    const moved = state.bubbleDrag.moved;
+    state.bubbleDrag.pointerId = null;
+    state.bubbleDrag.moved = false;
+    ui.bubble?.classList.remove('dragging');
+    if (!cancelled && !moved) {
+      restoreOverlay();
+    }
+  }
+
+  function handleBubblePointerUp(event) {
+    finishBubblePointer(event, false);
+  }
+
+  function handleBubblePointerCancel(event) {
+    finishBubblePointer(event, true);
+  }
+
+  function handleBubbleKeyDown(event) {
+    if (!state.minimized) return;
+    if (event.key === 'Enter' || event.key === ' ') {
+      event.preventDefault();
+      restoreOverlay();
+    }
+  }
+
+  // ── Local PIP drag + tap-to-swap ──
+  function handlePipPointerDown(event) {
+    if (!ui.localPip) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const pointerId = event.pointerId ?? 'mouse';
+    state.localPipDrag.pointerId = pointerId;
+    state.localPipDrag.startX = event.clientX;
+    state.localPipDrag.startY = event.clientY;
+    const rect = ui.localPip.getBoundingClientRect();
+    state.localPipDrag.baseX = rect.left;
+    state.localPipDrag.baseY = rect.top;
+    state.localPipDrag.moved = false;
+    ui.localPip.setPointerCapture?.(pointerId);
+  }
+
+  function handlePipPointerMove(event) {
+    if (state.localPipDrag.pointerId == null) return;
+    if (event.pointerId !== state.localPipDrag.pointerId) return;
+    const dx = event.clientX - state.localPipDrag.startX;
+    const dy = event.clientY - state.localPipDrag.startY;
+    if (!state.localPipDrag.moved && Math.hypot(dx, dy) > MIN_DRAG_DISTANCE) {
+      state.localPipDrag.moved = true;
+    }
+    if (!state.localPipDrag.moved) return;
+    const newX = state.localPipDrag.baseX + dx;
+    const newY = state.localPipDrag.baseY + dy;
+    const maxX = window.innerWidth - ui.localPip.offsetWidth - 8;
+    const maxY = window.innerHeight - ui.localPip.offsetHeight - 8;
+    ui.localPip.style.left = `${Math.min(Math.max(8, newX), maxX)}px`;
+    ui.localPip.style.top = `${Math.min(Math.max(8, newY), maxY)}px`;
+    ui.localPip.style.right = 'auto';
+    ui.localPip.style.bottom = 'auto';
+  }
+
+  function finishPipPointer(event, cancelled = false) {
+    if (state.localPipDrag.pointerId == null || event.pointerId !== state.localPipDrag.pointerId) return;
+    ui.localPip?.releasePointerCapture?.(state.localPipDrag.pointerId);
+    const moved = state.localPipDrag.moved;
+    state.localPipDrag.pointerId = null;
+    state.localPipDrag.moved = false;
+    if (!cancelled && !moved) {
+      toggleVideoSwap();
+    }
+  }
+
+  function handlePipPointerUp(event) { finishPipPointer(event, false); }
+  function handlePipPointerCancel(event) { finishPipPointer(event, true); }
+
+  function resetPipPosition() {
+    if (!ui.localPip) return;
+    ui.localPip.style.left = '';
+    ui.localPip.style.top = '';
+    ui.localPip.style.right = '';
+    ui.localPip.style.bottom = '';
+  }
+
+  // ── Video swap (tap local PIP to swap local/remote) ──
+  function toggleVideoSwap() {
+    if (!ui.remoteVideo || !ui.localPipVideo) return;
+    const session = getCallSessionSnapshot();
+    if (!session || session.kind !== CALL_REQUEST_KIND.VIDEO) return;
+    state.videoSwapped = !state.videoSwapped;
+    applyVideoSwap();
+  }
+
+  function applyVideoSwap() {
+    if (!ui.remoteVideo || !ui.localPipVideo) return;
+    // Use display stream (face-blurred when active) for self-preview
+    const localDisplay = getLocalDisplayStream();
+    const remoteStream = state._cachedRemoteStream || ui.remoteVideo.srcObject;
+    if (!state.videoSwapped) {
+      // Normal: main = remote, PIP = local (blurred)
+      if (remoteStream) {
+        ui.remoteVideo.srcObject = remoteStream;
+      }
+      if (localDisplay) {
+        ui.localPipVideo.srcObject = localDisplay;
+        ui.localPipVideo.muted = true;
+      }
+      ui.remoteVideo.style.transform = '';
+      ui.localPipVideo.style.transform = localMirrorTransform();
+      state._cachedRemoteStream = null;
+    } else {
+      // Swapped: main = local blurred (mirrored), PIP = remote
+      state._cachedRemoteStream = remoteStream;
+      if (localDisplay) {
+        ui.remoteVideo.srcObject = localDisplay;
+        ui.remoteVideo.muted = true;
+      }
+      if (remoteStream) {
+        ui.localPipVideo.srcObject = remoteStream;
+        ui.localPipVideo.muted = true;
+      }
+      ui.remoteVideo.style.transform = localMirrorTransform();
+      ui.localPipVideo.style.transform = '';
+    }
+    ui.remoteVideo.play().catch(() => {});
+    ui.localPipVideo.play().catch(() => {});
+  }
+
+  function resetVideoSwap() {
+    if (!state.videoSwapped) return;
+    state.videoSwapped = false;
+    state._cachedRemoteStream = null;
+    if (ui.remoteVideo) ui.remoteVideo.style.transform = '';
+    if (ui.localPipVideo) ui.localPipVideo.style.transform = localMirrorTransform();
+  }
+
+  function syncControlStates(session) {
+    const controls = session?.mediaState?.controls || {};
+    const localMuted = controls.audioMuted ?? isLocalAudioMuted();
+    setToggleState(ui.muteBtn, !!localMuted);
+    const videoEnabled = controls.videoEnabled ?? !isLocalVideoMuted();
+    setToggleState(ui.cameraBtn, !!videoEnabled);
+    syncBlurModeBtn();
+  }
+
+  function updateBubbleDetails(profile) {
+    if (!ui.bubble) return;
+    const safeProfile = profile || { name: t('common.friend'), peerAccountDigest: null, avatarUrl: null };
+    const labelName = safeProfile.name || t('common.friend');
+    ui.bubble.setAttribute('aria-label', `${t('calls.returnToCall')}`);
+    renderAvatarContent(ui.bubbleAvatar, safeProfile);
+  }
+
+  function syncAudio(session) {
+    const status = session?.status || CALL_SESSION_STATUS.IDLE;
+    const displayable = session && shouldDisplay(status);
+    if (!displayable) {
+      audio.stopLoops();
+    } else if (status === CALL_SESSION_STATUS.OUTGOING) {
+      audio.playOutgoingLoop();
+    } else if (status === CALL_SESSION_STATUS.INCOMING) {
+      audio.playIncomingLoop();
+    } else {
+      audio.stopLoops();
+    }
+    if (status === CALL_SESSION_STATUS.CONNECTING && state.lastStatus !== CALL_SESSION_STATUS.CONNECTING) {
+      playToneOnce('accepted', { callId: session?.callId });
+    }
+    const wasEnded = [CALL_SESSION_STATUS.ENDED, CALL_SESSION_STATUS.FAILED].includes(state.lastStatus);
+    if ([CALL_SESSION_STATUS.ENDED, CALL_SESSION_STATUS.FAILED].includes(status) && !wasEnded) {
+      playToneOnce('ended', { callId: session?.callId });
+    }
+    state.lastStatus = status;
+  }
+
+  function destroyWaitingBlurPipeline() {
+    if (state._waitingBlurPipeline) {
+      try { state._waitingBlurPipeline.destroy(); } catch {}
+      state._waitingBlurPipeline = null;
+    }
+  }
+
+  // Start a face blur pipeline for the waiting-screen preview in the background.
+  // Once the pipeline's canvas starts producing frames, swap the video
+  // element's srcObject to the blurred stream so the transition is seamless.
+  // Used for both outgoing and incoming video calls.
+  function startWaitingFaceBlur(rawStream) {
+    if (!isFaceBlurSupported()) return;
+    const videoTrack = rawStream.getVideoTracks()[0];
+    if (!videoTrack) return;
+    try {
+      destroyWaitingBlurPipeline();
+      const pipeline = createFaceBlurPipeline(videoTrack);
+      if (!pipeline || !pipeline.track) return;
+      pipeline.setMode(getFaceBlurMode());
+      state._waitingBlurPipeline = pipeline;
+      const blurredStream = new MediaStream([pipeline.track, ...rawStream.getAudioTracks()]);
+      // Wait a short period for the pipeline's hidden video to load and
+      // start drawing canvas frames, then swap to the blurred stream.
+      const swapDelay = 300;
+      setTimeout(() => {
+        if (!state._waitingBlurPipeline || state._waitingBlurPipeline !== pipeline) return;
+        if (!state._waitingPreview) return; // already cleaned up
+        state._waitingPreview = blurredStream;
+        if (ui.remoteVideo && ui.remoteVideo.srcObject !== blurredStream) {
+          ui.remoteVideo.srcObject = blurredStream;
+          ui.remoteVideo.muted = true;
+          ui.remoteVideo.play().catch(() => {});
+          log({ waitingPreview: 'switched to face blur stream' });
+        }
+      }, swapDelay);
+      log({ waitingPreview: 'face blur pipeline started, will swap in ' + swapDelay + 'ms' });
+    } catch (err) {
+      log({ waitingPreview: 'face blur setup failed', error: err?.message || String(err) });
+    }
+  }
+
+  // Obtain camera preview for the waiting screen (outgoing or incoming video calls).
+  // First checks sessionStore for a stream already cached by the composer.
+  // Falls back to a fresh getUserMedia when nothing is cached.
+  async function requestWaitingCameraPreview() {
+    // Native call mode: local/remote video is rendered natively (NativeCallVideoView)
+    // and the mic is owned by the native audio session. A WebView getUserMedia here
+    // would grab the camera/mic and fight the native session → silent call.
+    if (isNativeCallMode()) return;
+    if (state._waitingPreviewLoading || state._waitingPreview) return;
+    state._waitingPreviewLoading = true;
+    log({ waitingPreview: 'requesting' });
+    try {
+      // Prefer the stream already cached by the composer controller.
+      const cached = sessionStore?.cachedMicrophoneStream;
+      if (cached && cached.getVideoTracks().some((t) => t.readyState === 'live')) {
+        log({ waitingPreview: 'reusing cached stream', videoTracks: cached.getVideoTracks().length });
+        state._waitingPreview = cached;
+        // Start face blur pipeline in background; raw stream shows immediately
+        startWaitingFaceBlur(cached);
+        render();
+        return;
+      }
+      // No usable cached stream — acquire a fresh one.
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: true,
+        video: { facingMode: 'user', width: { ideal: 960 }, height: { ideal: 540 }, frameRate: { ideal: 30 } }
+      });
+      const vTracks = stream.getVideoTracks();
+      log({ waitingPreview: 'acquired fresh', videoTracks: vTracks.length, audioTracks: stream.getAudioTracks().length });
+      if (!vTracks.length) { log({ waitingPreview: 'no video tracks' }); return; }
+      state._waitingPreview = stream;
+      try { sessionStore.cachedMicrophoneStream = stream; } catch {}
+      // Start face blur pipeline in background; raw stream shows immediately
+      startWaitingFaceBlur(stream);
+      render();
+    } catch (err) {
+      log({ waitingPreview: 'failed', error: err?.message || String(err) });
+    } finally {
+      state._waitingPreviewLoading = false;
+    }
+  }
+
+  // callId of a foreground incoming call the native shell asked us to present
+  // in-app (CallKit was skipped for it). Null unless such a call is ringing.
+  let nativeInAppIncomingId = null;
+
+  // In-call controls auto-hide: reveal on tap, then fade out after a few seconds
+  // of inactivity (only while connected) to keep the call surface uncluttered.
+  let controlsHideTimer = null;
+  function revealControls() {
+    if (!ui.controlsRow) return;
+    ui.controlsRow.classList.remove('controls-hidden');
+    clearTimeout(controlsHideTimer);
+    controlsHideTimer = setTimeout(() => {
+      ui.controlsRow?.classList.add('controls-hidden');
+    }, 4000);
+  }
+  function cancelControlsAutoHide() {
+    clearTimeout(controlsHideTimer);
+    controlsHideTimer = null;
+    ui.controlsRow?.classList.remove('controls-hidden');
+  }
+
+  function render(session = getCallSessionSnapshot()) {
+    // iOS App incoming-call UI split:
+    //  • Background / lock-screen wake → the system CallKit UI presents the call,
+    //    so suppress the web floating card to avoid a duplicate.
+    //  • Foreground → the native shell intentionally does NOT ring CallKit and
+    //    signals `incomingCallPresentation {mode:'in-app'}`; the web card is then
+    //    the ONLY incoming UI and MUST render, otherwise the callee can't
+    //    answer/reject and the caller rings until timeout.
+    // Once answered (CONNECTING/IN_CALL) the in-call controls render normally either way.
+    if (session && isNativeApp() && session.status === CALL_SESSION_STATUS.INCOMING
+        && session.callId !== nativeInAppIncomingId) {
+      setVisibility(false);
+      updateBubbleDetails(null);
+      state.actionBusy = false;
+      return;
+    }
+    // Drop the in-app-incoming marker once this call stops ringing (answered/ended).
+    if (nativeInAppIncomingId && (!session
+        || session.callId !== nativeInAppIncomingId
+        || session.status !== CALL_SESSION_STATUS.INCOMING)) {
+      nativeInAppIncomingId = null;
+    }
+    ensureToneContext(session);
+    syncAudio(session);
+    if (!session || !shouldDisplay(session.status)) {
+      updateBubbleDetails(null);
+      setVisibility(false);
+      state.actionBusy = false;
+      return;
+    }
+    setVisibility(true);
+    const profile = resolveUiPeerProfile(session);
+    maybeLogPeerProfile(session, profile, state);
+    if (ui.nameLabel) ui.nameLabel.textContent = profile.name || t('common.friend');
+    if (ui.statusLabel) ui.statusLabel.textContent = describeStatus(session);
+    if (ui.secureLabel) ui.secureLabel.textContent = describeSecureStatus(session);
+    updateAvatar(ui.avatar, profile);
+    updateBubbleDetails(profile);
+    updateTimer(session);
+    syncControlStates(session);
+    const incoming = session.status === CALL_SESSION_STATUS.INCOMING;
+    const outgoing = session.status === CALL_SESSION_STATUS.OUTGOING;
+    const showResponseRow = incoming || outgoing;
+    const showControlsRow = [CALL_SESSION_STATUS.CONNECTING, CALL_SESSION_STATUS.IN_CALL].includes(session.status);
+    ui.actionsRow?.classList.toggle('hidden', !showResponseRow);
+    ui.controlsRow?.classList.toggle('hidden', !showControlsRow);
+    // Auto-hide the in-call controls only once connected; keep them pinned while
+    // connecting so the user always has them during setup.
+    const autoHideControls = session.status === CALL_SESSION_STATUS.IN_CALL;
+    ui.controlsRow?.classList.toggle('auto-hide', autoHideControls);
+    if (autoHideControls) revealControls();
+    else cancelControlsAutoHide();
+    if (ui.acceptBtn) ui.acceptBtn.style.display = incoming ? 'flex' : 'none';
+    if (ui.rejectBtn) ui.rejectBtn.style.display = incoming ? 'flex' : 'none';
+    if (ui.cancelBtn) ui.cancelBtn.style.display = outgoing ? 'flex' : 'none';
+    // E2EE gate: disable accept button until key derivation succeeds
+    // (bypassed after E2EE_TIMEOUT so the user can still answer)
+    const e2eePending = incoming && isKeyDerivationPending() && !e2eeGateBypass;
+    const disable = state.actionBusy || (incoming && e2eePending);
+    [ui.acceptBtn, ui.rejectBtn, ui.cancelBtn, ui.hangupBtn].forEach((btn) => {
+      if (btn) btn.disabled = (btn === ui.acceptBtn) ? disable : state.actionBusy;
+    });
+    // Show E2EE status hint on accept button
+    if (ui.acceptBtn && incoming && e2eePending) {
+      ui.acceptBtn.classList.add('e2ee-pending');
+    } else if (ui.acceptBtn) {
+      ui.acceptBtn.classList.remove('e2ee-pending');
+    }
+    const togglesDisabled = disable || !showControlsRow;
+    [ui.muteBtn].forEach((btn) => {
+      if (btn) btn.disabled = togglesDisabled;
+    });
+
+    // ── Video mode rendering ──
+    const isVideo = session.kind === CALL_REQUEST_KIND.VIDEO;
+    ui.card?.classList.toggle('video-mode', isVideo);
+    const inCall = session.status === CALL_SESSION_STATUS.IN_CALL;
+    const connecting = session.status === CALL_SESSION_STATUS.CONNECTING;
+
+    // Camera / flip buttons visibility
+    if (ui.cameraBtn) ui.cameraBtn.style.display = isVideo && showControlsRow ? 'flex' : 'none';
+    if (ui.flipCameraBtn) ui.flipCameraBtn.style.display = isVideo && showControlsRow ? 'flex' : 'none';
+    if (ui.cameraBtn) ui.cameraBtn.disabled = togglesDisabled;
+    if (ui.flipCameraBtn) ui.flipCameraBtn.disabled = togglesDisabled;
+    // Blur mode button — visible during both waiting and in-call for video calls
+    const showBlurBtn = isVideo && isFaceBlurSupported() && (showResponseRow || showControlsRow);
+    if (ui.blurModeBtn) {
+      ui.blurModeBtn.style.display = showBlurBtn ? 'flex' : 'none';
+      syncBlurModeBtn();
+    }
+
+    // Video elements
+    if (isVideo) {
+      const hasRemoteVideo = inCall || connecting;
+      const showWaiting = incoming || outgoing;
+      // Show remoteVideo during waiting (outgoing/incoming) for local camera preview,
+      // and during active call for remote video
+      if (ui.remoteVideo) ui.remoteVideo.style.display = (hasRemoteVideo || showWaiting) ? 'block' : 'none';
+      if (ui.localPip) ui.localPip.style.display = (inCall || connecting) ? 'block' : 'none';
+
+      // Waiting screen overlay (before connected)
+      if (ui.videoWaiting) {
+        ui.videoWaiting.style.display = showWaiting ? 'flex' : 'none';
+        if (showWaiting) {
+          renderAvatarContent(ui.videoWaitingAvatar, profile);
+          if (ui.videoWaitingName) ui.videoWaitingName.textContent = profile.name || t('common.friend');
+          if (ui.videoWaitingStatus) {
+            const videoStatusText = incoming ? t('calls.videoIncoming') : t('calls.videoDialing');
+            ui.videoWaitingStatus.textContent = videoStatusText;
+          }
+        }
+      }
+
+      // Waiting screen (outgoing or incoming): show local camera preview
+      // with face blur as background so the user can confirm the blur is active.
+      if (showWaiting) {
+        if (ui.remoteVideo) {
+          ui.remoteVideo.style.transform = localMirrorTransform();
+          // Check if the current srcObject still has live video tracks.
+          // Tracks can die when attachLocalMedia() clones them.
+          const curSrc = ui.remoteVideo.srcObject;
+          const hasLiveVideo = curSrc
+            && typeof curSrc.getVideoTracks === 'function'
+            && curSrc.getVideoTracks().some((t) => t.readyState === 'live');
+          if (!hasLiveVideo) {
+            // Find any available stream with live video tracks.
+            // Prefer getLocalDisplayStream() over getLocalStream() so the
+            // media-session face-blur pipeline output is used when active.
+            // Prioritise state._waitingPreview (which may already be blurred
+            // by the waiting pipeline) over the media-session stream.
+            const lds = getLocalDisplayStream();
+            const cached = sessionStore?.cachedMicrophoneStream;
+            const isLive = (s) => s && typeof s.getVideoTracks === 'function' && s.getVideoTracks().some((t) => t.readyState === 'live');
+            const source = [state._waitingPreview, lds, cached].find(isLive) || null;
+            log({
+              waitingPreview: 'searching',
+              direction: outgoing ? 'outgoing' : 'incoming',
+              hasLocalDisplayStream: !!lds,
+              ldsVideoLive: lds ? isLive(lds) : false,
+              hasPreview: !!state._waitingPreview,
+              hasCached: !!cached,
+              cachedVideoLive: cached ? isLive(cached) : false,
+              foundSource: !!source
+            });
+            if (source) {
+              ui.remoteVideo.srcObject = source;
+              ui.remoteVideo.muted = true;
+              ui.remoteVideo.play().then(() => {
+                log({ waitingPreviewPlay: 'success' });
+              }).catch((e) => {
+                log({ waitingPreviewPlay: 'failed', error: e?.message || String(e) });
+              });
+              // (Re)start face blur on the new source if the waiting preview
+              // was dead or not set.  Without this, a raw stream would stay
+              // on screen permanently after the original blurred track ends.
+              if (!isLive(state._waitingPreview)) {
+                state._waitingPreview = source;
+                startWaitingFaceBlur(source);
+              }
+            } else if (!state._waitingPreviewLoading) {
+              requestWaitingCameraPreview();
+            }
+          }
+        }
+        // Semi-transparent overlay so avatar/text is readable over camera feed
+        if (ui.videoWaiting) {
+          ui.videoWaiting.style.background = 'rgba(0,0,0,0.4)';
+        }
+      } else {
+        // Reset waiting preview state (call connected or ended)
+        if (state._waitingPreview) state._waitingPreview = null;
+        state._waitingPreviewLoading = false;
+        destroyWaitingBlurPipeline();
+        if (ui.remoteVideo) ui.remoteVideo.style.transform = '';
+        if (ui.videoWaiting) {
+          ui.videoWaiting.style.background = '';
+        }
+      }
+
+      // Top bar (during call)
+      if (ui.videoTopBar) {
+        ui.videoTopBar.style.display = (inCall || connecting) ? 'flex' : 'none';
+        if (inCall || connecting) {
+          renderAvatarContent(ui.videoTopBarAvatar, profile);
+          if (ui.videoTopBarName) ui.videoTopBarName.textContent = profile.name || t('common.friend');
+          if (ui.videoTopBarStatus) ui.videoTopBarStatus.textContent = describeSecureStatus(session);
+        }
+      }
+
+      // Re-attach remoteVideo srcObject and ensure play() is called.
+      // ontrack may fire before the element is visible, so play() can fail;
+      // re-trigger it here on every render while the call is active.
+      if (ui.remoteVideo && (inCall || connecting) && !state.videoSwapped) {
+        const rs = getRemoteStream();
+        if (rs) {
+          if (ui.remoteVideo.srcObject !== rs) {
+            ui.remoteVideo.srcObject = rs;
+            ui.remoteVideo.muted = true;
+          }
+          ui.remoteVideo.play().catch(() => {});
+        }
+      }
+
+      // Re-attach localPip srcObject if we have a local stream with video tracks.
+      // Use getLocalDisplayStream() so the PIP shows the face-blurred output
+      // (matching what the remote peer receives) when face blur is active.
+      // Skip re-attachment when video is swapped (user controls srcObject assignment).
+      if (ui.localPipVideo && (inCall || connecting) && !state.videoSwapped) {
+        const displayStream = getLocalDisplayStream();
+        if (displayStream && displayStream.getVideoTracks().length) {
+          // Always re-assign because getLocalDisplayStream() creates a new
+          // MediaStream wrapper each call; compare by video track identity.
+          const curTrackId = ui.localPipVideo.srcObject?.getVideoTracks?.()?.[0]?.id;
+          const newTrackId = displayStream.getVideoTracks()[0]?.id;
+          if (curTrackId !== newTrackId) {
+            ui.localPipVideo.srcObject = displayStream;
+            ui.localPipVideo.muted = true;
+            ui.localPipVideo.play().catch(() => {});
+          }
+        }
+      }
+
+      // Incoming video call: change accept button text
+      if (ui.acceptBtn && incoming) {
+        ui.acceptBtn.innerHTML = `<svg class="icon"><use href="#i-video"/></svg>${t('calls.acceptVideoCall')}`;
+      }
+    } else {
+      // Reset video elements when not video
+      resetVideoSwap();
+      resetPipPosition();
+      if (ui.remoteVideo) ui.remoteVideo.style.display = 'none';
+      if (ui.localPip) ui.localPip.style.display = 'none';
+      if (ui.videoWaiting) ui.videoWaiting.style.display = 'none';
+      if (ui.videoTopBar) ui.videoTopBar.style.display = 'none';
+      if (ui.cameraBtn) ui.cameraBtn.style.display = 'none';
+      if (ui.flipCameraBtn) ui.flipCameraBtn.style.display = 'none';
+      if (ui.blurModeBtn) ui.blurModeBtn.style.display = 'none';
+      // Reset accept button for voice
+      if (ui.acceptBtn && incoming) {
+        ui.acceptBtn.innerHTML = `<svg class="icon"><use href="#i-phone"/></svg>${t('calls.accept')}`;
+      }
+    }
+  }
+
+  async function handleAccept() {
+    const session = getCallSessionSnapshot();
+    if (!session?.callId || state.actionBusy) return;
+    if (!session.peerAccountDigest) {
+      showToast?.(t('calls.missingCallTarget'), { variant: 'error' });
+      return;
+    }
+    state.actionBusy = true;
+    render(session);
+
+    // Gate: require media permission before answering.
+    // Acquiring here also preserves the iOS Safari user gesture context
+    // and caches the stream for attachLocalMedia() to reuse.
+    //
+    // NATIVE CALL MODE: skip entirely. Native owns capture (AVAudioSession /
+    // RTCAudioSession + native mic permission). A WebView getUserMedia here would
+    // start WebKit's own AVAudioSession and fight the native one → silent call.
+    const wantVideo = session.kind === CALL_REQUEST_KIND.VIDEO;
+    let mediaStream = null;
+    if (!isNativeCallMode()) {
+      const audioConstraints = getCallAudioConstraints();
+      try {
+        const constraints = {
+          audio: audioConstraints,
+          video: wantVideo
+            ? { facingMode: 'user', width: { ideal: 960 }, height: { ideal: 540 }, frameRate: { ideal: 30 } }
+            : false
+        };
+        mediaStream = await navigator.mediaDevices.getUserMedia(constraints);
+      } catch (mediaErr) {
+        // Video call: fall back to audio-only (camera denied is tolerable)
+        if (wantVideo) {
+          try {
+            mediaStream = await navigator.mediaDevices.getUserMedia({ audio: audioConstraints, video: false });
+          } catch { /* handled below */ }
+        }
+        if (!mediaStream) {
+          log({ callAnswerMediaPermissionDenied: mediaErr?.message || mediaErr, callId: session.callId });
+          showToast?.(t('calls.micPermissionRequiredToAnswer'), { variant: 'error' });
+          // Treat permission denial as rejecting the call
+          try {
+            if (session.peerAccountDigest) {
+              sendCallSignal('call-reject', {
+                callId: session.callId,
+                targetAccountDigest: session.peerAccountDigest || null,
+                reason: 'media_permission_denied'
+              });
+            }
+            endCallMediaSession('rejected');
+            completeCallSession({ reason: 'rejected' });
+          } catch { }
+          state.actionBusy = false;
+          render();
+          return;
+        }
+      }
+      // Cache the live stream so attachLocalMedia() reuses it
+      try { sessionStore.cachedMicrophoneStream = mediaStream; } catch { }
+    }
+
+    try {
+      // acknowledgeCall is for server tracking only — do not block the call if it fails.
+      // Ephemeral calls do not have a server-tracked session, so skip entirely
+      // to avoid hitting resolvePublicAuth with an EPHEMERAL_* digest (→ 401).
+      if (!isEphemeralCallMode()) {
+        try {
+          await acknowledgeCall({ callId: session.callId, traceId: session.traceId });
+        } catch (ackErr) {
+          log({ callAcknowledgeError: ackErr?.message || ackErr, callId: session.callId });
+        }
+      }
+      updateCallSessionStatus(CALL_SESSION_STATUS.CONNECTING, { callId: session.callId });
+      // Send call-accept BEFORE media setup so the caller receives the state
+      // transition signal before the SDP answer, preventing state regression.
+      sendCallSignal('call-accept', {
+        callId: session.callId,
+        targetAccountDigest: session.peerAccountDigest || null,
+        metadata: { acceptedAt: Date.now() }
+      });
+      await acceptIncomingCallMedia({ callId: session.callId, peerAccountDigest: session.peerAccountDigest });
+    } catch (err) {
+      log({ callAcceptError: err?.message || err });
+      showToast?.(t('calls.answerFailed'), { variant: 'error' });
+    } finally {
+      state.actionBusy = false;
+      render();
+    }
+  }
+
+  async function handleReject() {
+    const session = getCallSessionSnapshot();
+    if (!session?.callId || state.actionBusy) return;
+    state.actionBusy = true;
+    render(session);
+    try {
+      if (session.peerAccountDigest) {
+        sendCallSignal('call-reject', {
+          callId: session.callId,
+          targetAccountDigest: session.peerAccountDigest || null,
+          reason: 'user_reject'
+        });
+      }
+      endCallMediaSession('rejected');
+      completeCallSession({ reason: 'rejected' });
+    } finally {
+      state.actionBusy = false;
+      render();
+    }
+  }
+
+  async function handleCancel() {
+    const session = getCallSessionSnapshot();
+    if (!session?.callId || state.actionBusy) return;
+    state.actionBusy = true;
+    render(session);
+    try {
+      // cancelCall is for server tracking only — do not block the cancel if it fails.
+      // Ephemeral calls do not have a server-tracked session, so skip entirely
+      // to avoid hitting resolvePublicAuth with an EPHEMERAL_* digest (→ 401).
+      if (!isEphemeralCallMode()) {
+        try {
+          await cancelCall({ callId: session.callId, reason: 'caller_cancelled' });
+        } catch (cancelErr) {
+          log({ callCancelApiError: cancelErr?.message || cancelErr, callId: session.callId });
+        }
+      }
+      endCallMediaSession('cancelled');
+      if (session.peerAccountDigest) {
+        sendCallSignal('call-cancel', {
+          callId: session.callId,
+          targetAccountDigest: session.peerAccountDigest || null,
+          reason: 'caller_cancelled'
+        });
+      }
+      completeCallSession({ reason: 'cancelled' });
+    } catch (err) {
+      log({ callCancelError: err?.message || err });
+      showToast?.(t('calls.endCallFailed'), { variant: 'error' });
+    } finally {
+      state.actionBusy = false;
+      render();
+    }
+  }
+
+  async function handleHangup() {
+    const session = getCallSessionSnapshot();
+    if (!session?.callId || state.actionBusy) return;
+    if (![CALL_SESSION_STATUS.CONNECTING, CALL_SESSION_STATUS.IN_CALL].includes(session.status)) {
+      return;
+    }
+    state.actionBusy = true;
+    render(session);
+    try {
+      if (session.peerAccountDigest) {
+        sendCallSignal('call-end', {
+          callId: session.callId,
+          targetAccountDigest: session.peerAccountDigest || null,
+          reason: 'hangup'
+        });
+      }
+      endCallMediaSession('hangup');
+      completeCallSession({ reason: 'hangup' });
+    } catch (err) {
+      log({ callHangupError: err?.message || err });
+      showToast?.(t('calls.endCallFailed'), { variant: 'error' });
+    } finally {
+      state.actionBusy = false;
+      render();
+    }
+  }
+
+  function handleMuteToggle() {
+    const session = getCallSessionSnapshot();
+    if (!session) return;
+    const controls = session.mediaState?.controls || {};
+    const next = !(controls.audioMuted ?? isLocalAudioMuted());
+    setLocalAudioMuted(next);
+  }
+
+  // Speaker / earpiece toggle — native app only (web on iOS can't control audio
+  // routing). The native shell performs the override and echoes the real route
+  // back via the `audioRouteChanged` event so the button stays in sync.
+  let speakerOn = false;
+  let speakerRouteWired = false;
+  function handleSpeakerToggle() {
+    speakerOn = !speakerOn;
+    setToggleState(ui.speakerBtn, speakerOn);
+    postNativeMessage('setAudioRoute', { speaker: speakerOn });
+  }
+
+  async function handleCameraToggle() {
+    const session = getCallSessionSnapshot();
+    if (!session) return;
+    const controls = session.mediaState?.controls || {};
+    const currentlyEnabled = controls.videoEnabled ?? !isLocalVideoMuted();
+    await toggleLocalVideo(!currentlyEnabled);
+  }
+
+  async function handleFlipCamera() {
+    await switchCamera();
+    // Update mirror transform — front camera is mirrored, rear is not
+    const mirror = localMirrorTransform();
+    if (ui.localPipVideo && !state.videoSwapped) {
+      ui.localPipVideo.style.transform = mirror;
+    }
+    if (ui.remoteVideo && state.videoSwapped) {
+      ui.remoteVideo.style.transform = mirror;
+    }
+    if (ui.miniLocalVideo) {
+      ui.miniLocalVideo.style.transform = mirror;
+    }
+  }
+
+  function handleBlurModeCycle() {
+    const current = getFaceBlurMode();
+    const idx = BLUR_MODE_CYCLE.indexOf(current);
+    const next = BLUR_MODE_CYCLE[(idx + 1) % BLUR_MODE_CYCLE.length];
+    setFaceBlurMode(next);
+    syncBlurModeBtn();
+    // Also update waiting pipeline if it exists
+    if (state._waitingBlurPipeline) {
+      state._waitingBlurPipeline.setMode(next);
+    }
+  }
+
+  ui.acceptBtn?.addEventListener('click', handleAccept);
+  ui.rejectBtn?.addEventListener('click', handleReject);
+  ui.cancelBtn?.addEventListener('click', handleCancel);
+  ui.hangupBtn?.addEventListener('click', handleHangup);
+  ui.muteBtn?.addEventListener('click', handleMuteToggle);
+  ui.speakerBtn?.addEventListener('click', handleSpeakerToggle);
+  // Speaker control is native-only; reveal it and sync to the real route.
+  if (isNativeApp() && ui.speakerBtn) {
+    ui.speakerBtn.style.display = '';
+    if (!speakerRouteWired) {
+      speakerRouteWired = true;
+      onNativeEvent('audioRouteChanged', ({ speaker } = {}) => {
+        speakerOn = !!speaker;
+        setToggleState(ui.speakerBtn, speakerOn);
+      });
+    }
+  }
+  // A foreground incoming call is NOT rung through CallKit; the native shell tells
+  // us to show the in-app card for it. Mark the callId so render() stops
+  // suppressing it, then re-render to surface the accept/reject UI immediately.
+  if (isNativeApp()) {
+    onNativeEvent('incomingCallPresentation', ({ callId, mode } = {}) => {
+      if (mode === 'in-app' && callId) {
+        nativeInAppIncomingId = callId;
+        render();
+      }
+    });
+  }
+  ui.cameraBtn?.addEventListener('click', handleCameraToggle);
+  ui.flipCameraBtn?.addEventListener('click', handleFlipCamera);
+  ui.blurModeBtn?.addEventListener('click', handleBlurModeCycle);
+  ui.infoBtn?.addEventListener('click', () => showCallInfoOverlay());
+  ui.minifyBtn?.addEventListener('click', minimizeOverlay);
+  // Tap anywhere on the call surface reveals the auto-hidden in-call controls
+  // (and resets the hide timer when tapping a control, keeping them up).
+  ui.card?.addEventListener('click', () => {
+    if (ui.controlsRow?.classList.contains('auto-hide')) revealControls();
+  });
+  // Wire video elements to media-session
+  if (ui.remoteVideo) setRemoteVideoElement(ui.remoteVideo);
+  if (ui.localPipVideo) setLocalVideoElement(ui.localPipVideo);
+  // Local PIP drag + tap-to-swap
+  ui.localPip?.addEventListener('pointerdown', handlePipPointerDown);
+  ui.localPip?.addEventListener('pointermove', handlePipPointerMove);
+  ui.localPip?.addEventListener('pointerup', handlePipPointerUp);
+  ui.localPip?.addEventListener('pointercancel', handlePipPointerCancel);
+
+  ui.bubble?.addEventListener('pointerdown', handleBubblePointerDown);
+  ui.bubble?.addEventListener('pointermove', handleBubblePointerMove);
+  ui.bubble?.addEventListener('pointerup', handleBubblePointerUp);
+  ui.bubble?.addEventListener('pointercancel', handleBubblePointerCancel);
+  ui.bubble?.addEventListener('keydown', handleBubbleKeyDown);
+  if (typeof window !== 'undefined') {
+    window.addEventListener('resize', handleWindowResize);
+  }
+
+  function handleSignalTone(signal) {
+    if (!signal?.type) return;
+    const type = String(signal.type);
+    const session = getCallSessionSnapshot();
+    ensureToneContext(session);
+    const callId = signal.callId || session?.callId || null;
+    if (type === 'call-accept') {
+      playToneOnce('accepted', { callId });
+      return;
+    }
+    if (['call-end', 'call-cancel', 'call-reject', 'call-busy'].includes(type)) {
+      playToneOnce('ended', { callId });
+      audio.stopLoops();
+    }
+  }
+
+  // ── E2EE key derivation retry for incoming calls ──
+  // When the callee receives an invite but the conversation token hasn't
+  // arrived yet (ephemeral key-exchange timing), retry every 500ms.
+  // After 10s, auto-reject the call.
+  const E2EE_RETRY_INTERVAL = 500;
+  const E2EE_TIMEOUT = 10_000;
+  let e2eeRetryTimer = null;
+  let e2eeTimeoutTimer = null;
+  let e2eeGateBypass = false;
+
+  function startE2eeRetry() {
+    stopE2eeRetry();
+    e2eeGateBypass = false;
+    const startedAt = Date.now();
+    e2eeRetryTimer = setInterval(async () => {
+      const session = getCallSessionSnapshot();
+      if (!session || session.status !== CALL_SESSION_STATUS.INCOMING) {
+        stopE2eeRetry();
+        return;
+      }
+      if (!isKeyDerivationPending()) {
+        // Keys derived (or no envelope) — stop retrying, update UI
+        stopE2eeRetry();
+        render(session);
+        return;
+      }
+      const ok = await retryDeriveKeys();
+      if (ok) {
+        stopE2eeRetry();
+        render(session);
+        log({ e2eeRetrySuccess: true, callId: session.callId, elapsedMs: Date.now() - startedAt });
+      }
+    }, E2EE_RETRY_INTERVAL);
+
+    e2eeTimeoutTimer = setTimeout(() => {
+      const session = getCallSessionSnapshot();
+      if (!session || session.status !== CALL_SESSION_STATUS.INCOMING) {
+        stopE2eeRetry();
+        return;
+      }
+      if (isKeyDerivationPending()) {
+        log({ e2eeRetryTimeout: true, callId: session.callId });
+        // Instead of auto-rejecting, bypass the E2EE gate and enable the
+        // accept button so the user can answer.  The media session's
+        // capability negotiation handles the E2EE mismatch gracefully.
+        // Silently rejecting caused "can't answer" UX with no explanation.
+        e2eeGateBypass = true;
+        stopE2eeRetry();
+        render(session);
+      }
+      stopE2eeRetry();
+    }, E2EE_TIMEOUT);
+  }
+
+  function stopE2eeRetry() {
+    if (e2eeRetryTimer) { clearInterval(e2eeRetryTimer); e2eeRetryTimer = null; }
+    if (e2eeTimeoutTimer) { clearTimeout(e2eeTimeoutTimer); e2eeTimeoutTimer = null; }
+  }
+
+  // ── Native CallKit bridge (iOS shell only; no-op elsewhere) ──
+  // Route system call-UI actions (answer / end / mute) through the same paths as
+  // the on-screen buttons so behaviour and signalling stay identical.
+  function handleNativeEnd() {
+    const session = getCallSessionSnapshot();
+    const status = session?.status;
+    if (status === CALL_SESSION_STATUS.INCOMING) handleReject();
+    else if (status === CALL_SESSION_STATUS.OUTGOING) handleCancel();
+    else handleHangup();
+  }
+  function handleNativeSetMuted(muted) {
+    const session = getCallSessionSnapshot();
+    const current = session?.mediaState?.controls?.audioMuted ?? isLocalAudioMuted();
+    if (current !== muted) handleMuteToggle();
+  }
+  setNativeCallActionHandlers({
+    answer: () => handleAccept(),
+    end: handleNativeEnd,
+    setMuted: handleNativeSetMuted
+  });
+  initNativeCallBridge();
+
+  const unsubscribers = [
+    subscribeCallEvent(CALL_EVENT.STATE, ({ session }) => {
+      render(session);
+      if (session?.mediaState?.status === CALL_MEDIA_STATE_STATUS.FAILED) {
+        showToast?.(t('calls.cannotCreateEncryptedChannel'), { variant: 'error' });
+      }
+      // Start E2EE retry when an incoming call has a pending envelope
+      if (session?.status === CALL_SESSION_STATUS.INCOMING && isKeyDerivationPending()) {
+        if (!e2eeRetryTimer) startE2eeRetry();
+      } else {
+        stopE2eeRetry();
+      }
+    }),
+    subscribeCallEvent(CALL_EVENT.SIGNAL, ({ signal }) => {
+      handleSignalTone(signal);
+      render();
+    }),
+    subscribeCallEvent(CALL_EVENT.ERROR, () => {
+      showToast?.(t('calls.callError'), { variant: 'error' });
+      render();
+    })
+  ];
+
+  render();
+
+  return () => {
+    unsubscribers.forEach((off) => {
+      try { off?.(); } catch {}
+    });
+    stopTimer();
+    stopE2eeRetry();
+    audio.dispose();
+    ui.acceptBtn?.removeEventListener('click', handleAccept);
+    ui.rejectBtn?.removeEventListener('click', handleReject);
+    ui.cancelBtn?.removeEventListener('click', handleCancel);
+    ui.hangupBtn?.removeEventListener('click', handleHangup);
+    ui.muteBtn?.removeEventListener('click', handleMuteToggle);
+    ui.speakerBtn?.removeEventListener('click', handleSpeakerToggle);
+    ui.cameraBtn?.removeEventListener('click', handleCameraToggle);
+    ui.flipCameraBtn?.removeEventListener('click', handleFlipCamera);
+    ui.blurModeBtn?.removeEventListener('click', handleBlurModeCycle);
+    ui.minifyBtn?.removeEventListener('click', minimizeOverlay);
+    setRemoteVideoElement(null);
+    setLocalVideoElement(null);
+    ui.localPip?.removeEventListener('pointerdown', handlePipPointerDown);
+    ui.localPip?.removeEventListener('pointermove', handlePipPointerMove);
+    ui.localPip?.removeEventListener('pointerup', handlePipPointerUp);
+    ui.localPip?.removeEventListener('pointercancel', handlePipPointerCancel);
+    ui.bubble?.removeEventListener('pointerdown', handleBubblePointerDown);
+    ui.bubble?.removeEventListener('pointermove', handleBubblePointerMove);
+    ui.bubble?.removeEventListener('pointerup', handleBubblePointerUp);
+    ui.bubble?.removeEventListener('pointercancel', handleBubblePointerCancel);
+    ui.bubble?.removeEventListener('keydown', handleBubbleKeyDown);
+    if (typeof window !== 'undefined') {
+      window.removeEventListener('resize', handleWindowResize);
+    }
+  };
+}

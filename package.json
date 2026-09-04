@@ -1,0 +1,19 @@
+{
+  "name": "messenger",
+  "version": "0.2.0",
+  "type": "module",
+  "license": "AGPL-3.0-only",
+  "private": true,
+  "scripts": {
+    "deploy:uat": "cd data-worker && npx wrangler deploy --env uat",
+    "deploy:prod": "cd data-worker && npx wrangler deploy"
+  },
+  "devDependencies": {
+    "wrangler": "^3.101.0"
+  },
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.890.0",
+    "@noble/hashes": "^2.0.1",
+    "libsodium-wrappers-sumo": "^0.8.2"
+  }
+}
